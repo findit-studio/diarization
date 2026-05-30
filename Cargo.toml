@@ -156,7 +156,7 @@ tch = { version = "0.24", optional = true }
 # ~1e-7 relative — small enough that the resnet+pooling output stays
 # within sub-ULP of pyannote on the 14-audio bench.
 realfft = "3"
-nalgebra = "0.34"
+nalgebra = "0.35"
 rand = { version = "0.10", default-features = false }
 rand_chacha = { version = "0.10", default-features = false }
 
