@@ -29,7 +29,9 @@
 //! spans as voice ranges close, which dia does not currently ship.
 
 mod offline_diarizer;
+mod range;
 
 pub use offline_diarizer::{
   DiarizedSpan, StreamingError, StreamingOfflineDiarizer, StreamingOfflineOptions,
 };
+pub use range::{RangeEmbeddings, RangeShapeError};
