@@ -55,6 +55,8 @@ pub mod spill {
 
 pub mod plda;
 
+pub mod provenance;
+
 pub mod pipeline;
 
 pub mod reconstruct;

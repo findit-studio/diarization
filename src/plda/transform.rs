@@ -512,6 +512,16 @@ impl PldaTransform {
   pub fn phi(&self) -> &[f64] {
     self.phi.as_slice()
   }
+
+  /// The clustering / PLDA stage identity for provenance stamping —
+  /// the community-1 diarization pipeline. The version is fixed by the
+  /// embedded weights ([`crate::provenance::DIARIZATION_PLDA_VERSION`]).
+  pub fn identity(&self) -> crate::provenance::ModelIdentity {
+    crate::provenance::ModelIdentity::new(
+      crate::provenance::DIARIZATION_FAMILY,
+      crate::provenance::DIARIZATION_PLDA_VERSION,
+    )
+  }
 }
 
 /// In-place L2 normalization with explicit error reporting. Returns

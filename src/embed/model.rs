@@ -397,6 +397,9 @@ mod tch_backend {
 /// (ORT or tch). `Send`-only; one instance per worker thread.
 pub struct EmbedModel {
   backend: Box<dyn EmbedBackend>,
+  /// Basename of the file this model was loaded from, or `None` for an
+  /// in-memory model. Feeds the dynamic version of [`Self::identity`].
+  source: Option<String>,
 }
 
 // Manual `Debug` so callers can `dbg!()` / `{:?}`-format an
@@ -488,6 +491,7 @@ impl EmbedModel {
       })?;
     Ok(Self {
       backend: Box::new(ort_backend::OrtBackend { session }),
+      source: path.file_name().map(|n| n.to_string_lossy().into_owned()),
     })
   }
 
@@ -509,6 +513,7 @@ impl EmbedModel {
     let session = builder.commit_from_memory(bytes)?;
     Ok(Self {
       backend: Box::new(ort_backend::OrtBackend { session }),
+      source: None,
     })
   }
 
@@ -529,7 +534,25 @@ impl EmbedModel {
     })?;
     Ok(Self {
       backend: Box::new(tch_backend::TchBackend { module }),
+      source: path.file_name().map(|n| n.to_string_lossy().into_owned()),
     })
+  }
+
+  /// Basename of the file this model was loaded from, or `None` for an
+  /// in-memory model. Feeds the dynamic version of [`Self::identity`].
+  pub fn source_basename(&self) -> Option<&str> {
+    self.source.as_deref()
+  }
+
+  /// The WeSpeaker embedding identity for provenance stamping. Family
+  /// is [`crate::provenance::WESPEAKER_FAMILY`]; version is the loaded
+  /// file basename when available, else the family name.
+  pub fn identity(&self) -> crate::provenance::ModelIdentity {
+    let version = self
+      .source
+      .clone()
+      .unwrap_or_else(|| crate::provenance::WESPEAKER_FAMILY.to_string());
+    crate::provenance::ModelIdentity::new(crate::provenance::WESPEAKER_FAMILY, version)
   }
 
   /// Embed a single 2-second audio clip. Returns the raw (un-normalized)
