@@ -158,6 +158,20 @@ pub enum StreamingShapeError {
   /// `max_iters` exceeds the documented cap. Caught upfront.
   #[error("max_iters ({got}) exceeds cap ({cap})")]
   MaxItersExceedsCap { got: usize, cap: usize },
+  /// A concatenated-tensor length computation overflowed `usize` while
+  /// fanning the accumulated ranges into the single global clustering
+  /// input. `total_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK`,
+  /// `total_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`, or the
+  /// `Σ count.len()` output-frame total exceeded `usize::MAX`. Plain
+  /// `*` / `Σ` would panic in debug or wrap to a small value in
+  /// release (then under-allocate and write out of bounds); reject it
+  /// as a typed error from the `Result`-returning API instead.
+  #[error("concatenated {what} length overflows usize at clustering fan-in")]
+  TotalShapeOverflow {
+    /// Which aggregate overflowed (`"segmentations"` /
+    /// `"raw_embeddings"` / `"output_frames"`).
+    what: &'static str,
+  },
 }
 
 /// Configuration for [`StreamingOfflineDiarizer`].
@@ -629,7 +643,19 @@ pub(crate) fn cluster_ranges_inner(
   if ranges.is_empty() {
     return Ok(Arc::from([] as [DiarizedSpan; 0]));
   }
-  let total_chunks: usize = ranges.iter().map(|r| r.num_chunks()).sum();
+  // Checked sum: each range's `num_chunks` is bounded (its
+  // segmentations buffer of `num_chunks * FRAMES_PER_WINDOW *
+  // SLOTS_PER_CHUNK` cells already exists in memory), but an
+  // adversarial slice of many ranges could overflow the running total
+  // — which would panic in debug or wrap in release before the
+  // products below. Fold with `checked_add`.
+  let total_chunks: usize = ranges.iter().try_fold(0usize, |acc, r| {
+    acc
+      .checked_add(r.num_chunks())
+      .ok_or(StreamingShapeError::TotalShapeOverflow {
+        what: "segmentations",
+      })
+  })?;
   if total_chunks == 0 {
     return Err(StreamingShapeError::AllRangesEmpty.into());
   }
@@ -642,8 +668,24 @@ pub(crate) fn cluster_ranges_inner(
   // `all_emb` ≈ 11 MB / hour. Both cross the 64 MiB default
   // threshold past ~5 h of accumulated voice. Spill-back so we
   // don't OOM the heap.
-  let total_segs_len = total_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
-  let total_emb_len = total_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
+  // Checked shape arithmetic at the cluster-aggregation boundary: a
+  // huge `total_chunks` overflows these products. Plain `*` panics in
+  // debug and wraps to a small value in release — the wrapped length
+  // would under-allocate `all_segs` / `all_emb`, then the
+  // `copy_from_slice` fan-in below writes out of bounds. Surface the
+  // overflow as a typed error from this `Result`-returning API.
+  let total_segs_len = total_chunks
+    .checked_mul(FRAMES_PER_WINDOW)
+    .and_then(|n| n.checked_mul(SLOTS_PER_CHUNK))
+    .ok_or(StreamingShapeError::TotalShapeOverflow {
+      what: "segmentations",
+    })?;
+  let total_emb_len = total_chunks
+    .checked_mul(SLOTS_PER_CHUNK)
+    .and_then(|n| n.checked_mul(EMBEDDING_DIM))
+    .ok_or(StreamingShapeError::TotalShapeOverflow {
+      what: "raw_embeddings",
+    })?;
   let mut all_segs = crate::ops::spill::SpillBytesMut::<f64>::zeros(total_segs_len, spill)?;
   let mut all_emb = crate::ops::spill::SpillBytesMut::<f32>::zeros(total_emb_len, spill)?;
   {
@@ -662,7 +704,16 @@ pub(crate) fn cluster_ranges_inner(
   }
 
   // ── 2. Concatenate count tensors (per-range adjacent in output) ─
-  let total_output_frames: usize = ranges.iter().map(|r| r.count().len()).sum();
+  // Checked sum for the same reason as `total_chunks`: each range's
+  // `count` buffer already exists, but the running total over an
+  // adversarial slice could overflow before `SpillBytesMut::zeros`.
+  let total_output_frames: usize = ranges.iter().try_fold(0usize, |acc, r| {
+    acc
+      .checked_add(r.count().len())
+      .ok_or(StreamingShapeError::TotalShapeOverflow {
+        what: "output_frames",
+      })
+  })?;
   let mut all_count = crate::ops::spill::SpillBytesMut::<u8>::zeros(total_output_frames, spill)?;
   {
     let buf = all_count.as_mut_slice();
