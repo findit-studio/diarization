@@ -126,18 +126,75 @@ pub enum RangeShapeError {
      (count overflows usize or exceeds MAX_OUTPUT_FRAMES)"
   )]
   InvalidGeometry,
-  /// `segmentations` contains a non-finite value (NaN / +inf / -inf).
+  /// A `segmentations` cell is neither exactly `0.0` nor exactly `1.0`.
   ///
-  /// The public constructor DERIVES `count` from `segmentations` (it no
-  /// longer trusts a caller-supplied count — see [`RangeEmbeddings::new`]);
-  /// the derivation thresholds each cell against the onset, a comparison
-  /// that is asymmetric on non-finite inputs (NaN/-inf compare false,
-  /// +inf compares true), so a degraded segmentation backend emitting
-  /// NaN/inf would silently fold into a finite-looking count. Reject it
-  /// at the boundary — the same policy `aggregate::try_count_pyannote`
-  /// and `reconstruct` apply to the segmentation tensor.
-  #[error("segmentations contains a non-finite value (NaN / +inf / -inf)")]
-  NonFiniteSegmentations,
+  /// The carrier contract is that `segmentations` is **hard 0/1**
+  /// activity — the binarized `to_multilabel(soft=False)` output the
+  /// internal `build_range` path produces (`speakers[s] as f64`, always
+  /// `0.0`/`1.0`). Every downstream consumer reads it on that
+  /// assumption, and they DISAGREE on any other value:
+  ///
+  /// - The boundary's own count derivation
+  ///   ([`aggregate::try_count_pyannote`](crate::aggregate::try_count_pyannote))
+  ///   thresholds each cell at the onset (`v >= 0.5`), so a fractional
+  ///   cell like `0.49` derives an active count of **0** (silence).
+  /// - But `offline::algo`'s `filter_embeddings` treats any `seg > 0.0`
+  ///   as an active speaker AND sums the raw cell magnitude into its
+  ///   clean-frame ratio, so `0.49` is "active" there and contributes a
+  ///   fractional `0.49` instead of a whole frame.
+  /// - And `reconstruct`'s stage-1 clustered-segmentation step ranks the
+  ///   raw cell magnitude (`max over speakers of segmentations[...]`) in
+  ///   its top-`count` binarize.
+  ///
+  /// A malformed-fractional carrier therefore passes the boundary,
+  /// derives a silent (all-zero) count, yet still drives
+  /// `filter_embeddings` to mark the slot active and burn AHC/VBx +
+  /// PLDA work on it (or hit a PLDA degenerate-norm error on a near-zero
+  /// embedding) — violating the hard-0/1 source-of-truth contract. Non-
+  /// binary values cannot arise from the real binarized segmentation
+  /// path; reject them at the boundary. (`2.0`, `0.49`, NaN, `+inf` are
+  /// all non-`{0,1}` and all rejected here; finiteness is subsumed —
+  /// NaN/±inf are not `0.0`/`1.0`.)
+  #[error(
+    "segmentations[{index}] ({got}) must be exactly 0.0 or 1.0 (the hard-0/1 carrier contract)"
+  )]
+  NonBinarySegmentations {
+    /// Flat index of the offending cell in `[chunk][frame][slot]` order.
+    index: usize,
+    /// The offending value.
+    got: f64,
+  },
+  /// A `raw_embeddings` cell is non-finite (NaN / +inf / -inf).
+  ///
+  /// The carrier transports the raw WeSpeaker vectors straight into the
+  /// global clustering pass. A NaN/±inf cell poisons that pass with no
+  /// rejection at the carrier boundary: it flows into the concatenated
+  /// embedding tensor, then into PLDA projection / AHC / VBx /
+  /// centroid-cosine scoring. `assign_embeddings` DOES finite-check
+  /// every embedding row (`pipeline::algo`), but only on the
+  /// `num_train >= 2` clustering path — the `num_train < 2` pyannote
+  /// fast path skips it entirely, and the PLDA `from_raw_array` finite
+  /// guard only runs on the *active* (clean-frame) train slots, so a
+  /// non-finite cell in an inactive or sub-threshold slot reaches the
+  /// carrier unchecked. The internal `build_range` path can never
+  /// produce one (it rejects non-finite embedder output and otherwise
+  /// writes finite values or leaves zeros); enforce the same finiteness
+  /// at the public boundary so the contract holds for every consumer
+  /// regardless of which clustering branch runs.
+  ///
+  /// Only finiteness is enforced here, NOT the per-vector min-norm the
+  /// PLDA boundary applies: inactive slots are legitimately all-zero
+  /// (norm 0) by construction in `build_range`, so a per-slot min-norm
+  /// check would reject almost every valid carrier. The min-norm
+  /// invariant is correctly scoped to the *active* train slots, where
+  /// `plda::RawEmbedding::from_raw_array` already enforces it.
+  #[error("raw_embeddings[{index}] ({got}) must be finite (no NaN / +inf / -inf)")]
+  NonFiniteEmbeddings {
+    /// Flat index of the offending cell in `[chunk][slot][dim]` order.
+    index: usize,
+    /// The offending value.
+    got: f32,
+  },
   /// Deriving `count` from `segmentations` failed to allocate its
   /// spill-backed scratch buffers (`aggregate::try_count_pyannote`
   /// reserves two `num_output_frames`-long f64 working buffers that may
@@ -204,6 +261,54 @@ fn validate_geometry(
   Ok(())
 }
 
+/// Enforce the **hard-0/1** segmentation contract: every cell is exactly
+/// `0.0` or `1.0`.
+///
+/// This is the source-of-truth invariant the whole `cluster` path bakes
+/// in. The binarized `to_multilabel(soft=False)` output the internal
+/// `build_range` path produces is always `{0.0, 1.0}` (`speakers[s] as
+/// f64`); every downstream consumer reads `segmentations` on that
+/// assumption but disagrees on any other value (see
+/// [`RangeShapeError::NonBinarySegmentations`]):
+/// - the count derivation thresholds at `>= 0.5` (so `0.49` ⇒ count 0),
+/// - `filter_embeddings` treats `> 0.0` as active and sums the raw
+///   magnitude into the clean-frame ratio,
+/// - `reconstruct` ranks the raw magnitude in its top-`count` binarize.
+///
+/// A non-binary cell therefore reads inconsistently across consumers —
+/// the exact malformed-fractional class R4 flagged. Reject it at the
+/// boundary. This check also **subsumes** the finiteness check the count
+/// derivation would otherwise apply (NaN/±inf are not `0.0`/`1.0`), so it
+/// is the single segmentation-value gate.
+fn validate_segmentations_binary(segmentations: &[f64]) -> Result<(), RangeShapeError> {
+  for (index, &got) in segmentations.iter().enumerate() {
+    if got != 0.0 && got != 1.0 {
+      return Err(RangeShapeError::NonBinarySegmentations { index, got });
+    }
+  }
+  Ok(())
+}
+
+/// Enforce that every `raw_embeddings` cell is **finite** (no NaN/±inf).
+///
+/// The carrier hands these raw WeSpeaker vectors straight into the global
+/// clustering pass; a non-finite cell poisons PLDA / AHC / VBx / cosine
+/// scoring. The deep `assign_embeddings` finite-check only runs on the
+/// `num_train >= 2` path and `from_raw_array`'s only on active train
+/// slots, so a non-finite cell in an inactive / sub-threshold slot would
+/// reach clustering unchecked. `build_range` never emits one; mirror that
+/// guarantee at the public boundary (see
+/// [`RangeShapeError::NonFiniteEmbeddings`] for why only finiteness, not
+/// the per-active-slot min-norm, is the carrier invariant).
+fn validate_embeddings_finite(raw_embeddings: &[f32]) -> Result<(), RangeShapeError> {
+  for (index, &got) in raw_embeddings.iter().enumerate() {
+    if !got.is_finite() {
+      return Err(RangeShapeError::NonFiniteEmbeddings { index, got });
+    }
+  }
+  Ok(())
+}
+
 /// DERIVE the per-output-frame `count` for one range from its
 /// `segmentations` + geometry, using the SAME
 /// [`aggregate::try_count_pyannote`](crate::aggregate::try_count_pyannote)
@@ -220,13 +325,13 @@ fn validate_geometry(
 /// `num_output_frames` length; reconstruct then emits no spans.
 ///
 /// [`validate_geometry`] must run first (it guarantees the
-/// start/duration/step invariants), and the segmentations-length check
-/// must already have passed (fixed `FRAMES_PER_WINDOW` /
-/// [`SLOTS_PER_CHUNK`]). With those satisfied, the only residual
-/// failures are:
-/// - a non-finite segmentation cell → [`RangeShapeError::NonFiniteSegmentations`]
-///   (checked here directly so the precise typed error does not depend on
-///   `aggregate`'s non-re-exported inner `ShapeError`);
+/// start/duration/step invariants), the segmentations-length check must
+/// already have passed (fixed `FRAMES_PER_WINDOW` / [`SLOTS_PER_CHUNK`]),
+/// and `validate_segmentations_binary` must already have verified every
+/// cell is exactly `0.0`/`1.0` (which subsumes finiteness, so
+/// `try_count_pyannote`'s own non-finite-segmentation guard can never
+/// fire on this path). With those satisfied, the only residual failures
+/// are:
 /// - a geometry whose derived output-frame count overflows / exceeds the
 ///   cap → [`RangeShapeError::InvalidGeometry`];
 /// - a spill scratch-allocation failure → [`RangeShapeError::CountDerivationFailed`].
@@ -241,14 +346,6 @@ fn derive_count(
   chunks_sw: SlidingWindow,
   frames_sw: SlidingWindow,
 ) -> Result<Arc<[u8]>, RangeShapeError> {
-  // Reject non-finite segmentation cells up front with the precise
-  // typed error. `try_count_pyannote` rejects them too, but its inner
-  // `ShapeError` is not re-exported from `aggregate`, so we cannot
-  // name that variant when mapping its error; checking here keeps the
-  // boundary error specific without widening another module's API.
-  if segmentations.iter().any(|v| !v.is_finite()) {
-    return Err(RangeShapeError::NonFiniteSegmentations);
-  }
   try_count_pyannote(
     segmentations,
     num_chunks,
@@ -266,12 +363,14 @@ fn derive_count(
     // Every `ShapeError` reachable here is precluded by this caller's
     // prior checks (`num_chunks != 0`, `validate_geometry`, the
     // exact-length check, fixed positive `FRAMES_PER_WINDOW` /
-    // `SLOTS_PER_CHUNK`, finite `DERIVE_ONSET`, the finite-segmentation
-    // check above) EXCEPT an output-frame count that overflows or
-    // exceeds `MAX_OUTPUT_FRAMES` for an otherwise-valid-looking but
-    // saturating geometry — the residual `InvalidGeometry` case. Map
-    // the whole shape residue to `InvalidGeometry` so the boundary
-    // stays panic-free even if an upstream precondition were relaxed.
+    // `SLOTS_PER_CHUNK`, finite `DERIVE_ONSET`, and the hard-0/1
+    // segmentation check at the boundary — which subsumes
+    // `try_count_pyannote`'s non-finite-segmentation guard) EXCEPT an
+    // output-frame count that overflows or exceeds `MAX_OUTPUT_FRAMES`
+    // for an otherwise-valid-looking but saturating geometry — the
+    // residual `InvalidGeometry` case. Map the whole shape residue to
+    // `InvalidGeometry` so the boundary stays panic-free even if an
+    // upstream precondition were relaxed.
     crate::aggregate::Error::Shape(_) => RangeShapeError::InvalidGeometry,
   })
 }
@@ -339,11 +438,18 @@ impl RangeEmbeddings {
   /// - `num_chunks`: number of 10 s segmentation chunks in this range.
   /// - `segmentations`: hard 0/1 activity, flattened
   ///   `[chunk][frame][slot]`, length
-  ///   `num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK`. The count is
-  ///   derived from these, so they must be finite (NaN / ±inf rejected).
+  ///   `num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK`. **Every cell
+  ///   must be exactly `0.0` or `1.0`** — the source-of-truth contract
+  ///   the count derivation, `filter_embeddings`, and `reconstruct` all
+  ///   bake in (they disagree on any other value). Non-binary cells
+  ///   (`0.49`, `2.0`, NaN, ±inf) are rejected.
   /// - `raw_embeddings`: raw WeSpeaker vectors, flattened
   ///   `[chunk][slot][dim]`, length
-  ///   `num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`.
+  ///   `num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`. **Every cell must
+  ///   be finite** (NaN / ±inf rejected) — a non-finite cell poisons the
+  ///   downstream PLDA / AHC / VBx clustering pass. Inactive slots are
+  ///   legitimately all-zero; only finiteness (not the per-active-slot
+  ///   PLDA min-norm) is required at this boundary.
   /// - `chunks_sw` / `frames_sw`: local (range-start = 0) timing.
   ///
   /// The owned `Vec`s are wrapped as heap-backed [`SpillBytes`]
@@ -359,8 +465,10 @@ impl RangeEmbeddings {
   /// ([`NonPositiveWindowParameter`](RangeShapeError::NonPositiveWindowParameter)),
   /// the derived output-frame count overflows or exceeds the cap
   /// ([`InvalidGeometry`](RangeShapeError::InvalidGeometry)),
-  /// `segmentations` contains a non-finite cell
-  /// ([`NonFiniteSegmentations`](RangeShapeError::NonFiniteSegmentations)),
+  /// `segmentations` contains a non-binary cell
+  /// ([`NonBinarySegmentations`](RangeShapeError::NonBinarySegmentations)),
+  /// `raw_embeddings` contains a non-finite cell
+  /// ([`NonFiniteEmbeddings`](RangeShapeError::NonFiniteEmbeddings)),
   /// or the count derivation's scratch allocation fails
   /// ([`CountDerivationFailed`](RangeShapeError::CountDerivationFailed)).
   #[allow(clippy::too_many_arguments)]
@@ -414,6 +522,24 @@ impl RangeEmbeddings {
     // span. Reject the full protocol contract here so a malformed or
     // version-skewed payload can never reach clustering.
     validate_geometry(chunks_sw, frames_sw)?;
+    // Enforce the FULL caller-tensor contract every downstream consumer
+    // assumes, BEFORE deriving the count or handing off:
+    //
+    // 1. `segmentations` is hard 0/1. The count derivation thresholds at
+    //    0.5, but `filter_embeddings` treats `> 0.0` as active (and sums
+    //    the raw magnitude) and `reconstruct` ranks the raw magnitude —
+    //    so any non-binary cell (`0.49`, `2.0`, NaN, ±inf) reads
+    //    inconsistently across consumers. This subsumes the finiteness
+    //    check the count derivation would otherwise apply.
+    // 2. `raw_embeddings` is finite. A NaN/±inf cell poisons PLDA / AHC /
+    //    VBx / cosine scoring; the deep finite-checks only cover the
+    //    `num_train >= 2` path / active train slots, so enforce it here.
+    //
+    // `build_range` guarantees both by construction, so the internal
+    // `from_spill_parts` hot path skips these — only this public,
+    // untrusted-tensor `new` validates.
+    validate_segmentations_binary(&segmentations)?;
+    validate_embeddings_finite(&raw_embeddings)?;
     // DERIVE `count` from `segmentations` instead of trusting a
     // caller-supplied one. The prior design accepted a `count` argument
     // and only validated its LENGTH against the geometry — but length
@@ -423,8 +549,9 @@ impl RangeEmbeddings {
     // class). Computing the count here from the segmentations via the
     // same helper `build_range` uses makes count a pure function of the
     // segmentations this carrier also stores, so forgery is
-    // unrepresentable. (`derive_count` runs after `validate_geometry`,
-    // which guarantees the geometry invariants the derivation relies on.)
+    // unrepresentable. (`derive_count` runs after `validate_geometry` and
+    // the hard-0/1 check, which guarantee the invariants the derivation
+    // relies on.)
     let count = derive_count(&segmentations, num_chunks, chunks_sw, frames_sw)?;
     Ok(Self {
       abs_start_sample,
@@ -633,10 +760,54 @@ mod tests {
     );
   }
 
-  /// The derive boundary rejects non-finite segmentation cells (NaN /
-  /// ±inf) rather than threshold-comparing them into a misleading count.
-  /// `try_count_pyannote`'s segmentation finite-check surfaces here as a
-  /// typed `NonFiniteSegmentations`.
+  /// R4 (the malformed-fractional class): the boundary rejects a
+  /// non-binary segmentation cell like `0.49`. Such a cell thresholds to
+  /// `0` in the count derivation (silence) but `filter_embeddings` reads
+  /// `> 0.0` as active and `reconstruct` ranks its raw magnitude — so it
+  /// reads inconsistently across consumers and must never reach
+  /// clustering. The error carries the exact offending index + value.
+  #[test]
+  fn new_rejects_fractional_segmentation() {
+    let num_chunks = 1;
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    let mut seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    // A carrier that derives an all-zero (silent) count yet is "active"
+    // under `filter_embeddings`'s `> 0.0` rule — the R4 boundary bypass.
+    seg[7] = 0.49;
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw(), frames_sw());
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonBinarySegmentations { index: 7, got }) if got == 0.49
+      ),
+      "got {r:?}"
+    );
+  }
+
+  /// The boundary rejects an out-of-`{0,1}` segmentation cell like `2.0`
+  /// (powerset binarization can only emit `0.0`/`1.0`; anything else is a
+  /// corrupt / version-skewed payload). Same `NonBinarySegmentations`
+  /// gate as the fractional case.
+  #[test]
+  fn new_rejects_above_one_segmentation() {
+    let num_chunks = 1;
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    let mut seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    seg[0] = 2.0;
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw(), frames_sw());
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonBinarySegmentations { index: 0, got }) if got == 2.0
+      ),
+      "got {r:?}"
+    );
+  }
+
+  /// Non-finite segmentation cells (NaN / ±inf) are also non-`{0,1}`, so
+  /// the same hard-0/1 gate rejects them (it subsumes the old standalone
+  /// finite check) — never threshold-comparing them into a misleading
+  /// count.
   #[test]
   fn new_rejects_non_finite_segmentations() {
     let num_chunks = 1;
@@ -646,10 +817,67 @@ mod tests {
       seg[0] = bad;
       let r = RangeEmbeddings::new(0, num_chunks, seg, emb.clone(), chunks_sw(), frames_sw());
       assert!(
-        matches!(r, Err(RangeShapeError::NonFiniteSegmentations)),
+        matches!(
+          r,
+          Err(RangeShapeError::NonBinarySegmentations { index: 0, got })
+            if (got.is_nan() && bad.is_nan()) || got == bad
+        ),
         "got {r:?} for segmentation cell {bad}"
       );
     }
+  }
+
+  /// A NaN (or ±inf) raw-embedding cell is rejected at the boundary
+  /// before it can poison the downstream PLDA / AHC / VBx clustering
+  /// pass. Pre-empts the R5 finding: the deep `assign_embeddings` finite-
+  /// check only runs on the `num_train >= 2` path and `from_raw_array`'s
+  /// only on active train slots, so the carrier must guarantee finiteness
+  /// itself. Segmentations are valid hard-0/1, isolating the embedding
+  /// gate.
+  #[test]
+  fn new_rejects_non_finite_raw_embedding() {
+    let num_chunks = 1;
+    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let mut emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+      emb[3] = bad;
+      let r = RangeEmbeddings::new(0, num_chunks, seg.clone(), emb, chunks_sw(), frames_sw());
+      assert!(
+        matches!(
+          r,
+          Err(RangeShapeError::NonFiniteEmbeddings { index: 3, got })
+            if (got.is_nan() && bad.is_nan()) || got == bad
+        ),
+        "got {r:?} for raw_embedding cell {bad}"
+      );
+    }
+  }
+
+  /// Valid hard-0/1 segmentations + finite embeddings construct, and a
+  /// hard-1 active frame derives a NONZERO count cell (the binarized
+  /// count path is exercised, not just the all-silent one). Confirms the
+  /// new gates pass legitimate input through unchanged.
+  #[test]
+  fn new_accepts_hard_one_segmentations_and_derives_active_count() {
+    let num_chunks = 1;
+    // One speaker (slot 0) active across EVERY frame of the chunk — hard
+    // 1.0. That single-active pattern yields count == 1 on the frames the
+    // chunk covers, so the derived count is not all-zero.
+    let mut seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    // Activate slot 0 (`s = 0`) of every frame: cell `[0][f][0]` is at
+    // flat index `f * SLOTS_PER_CHUNK`.
+    for f in 0..FRAMES_PER_WINDOW {
+      seg[f * SLOTS_PER_CHUNK] = 1.0;
+    }
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw(), frames_sw())
+      .expect("valid hard-0/1 + finite input constructs");
+    assert_eq!(r.count().len(), count_len(num_chunks));
+    assert!(
+      r.count().iter().any(|&c| c >= 1),
+      "a fully-active speaker slot must derive at least one nonzero count cell, got {:?}",
+      &r.count()[..r.count().len().min(8)]
+    );
   }
 
   /// FINDING 3: a `num_chunks` large enough to overflow the
