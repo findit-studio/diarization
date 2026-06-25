@@ -809,15 +809,23 @@ mod refactor_tests {
     let num_chunks = 1;
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS];
     let emb = vec![0.0_f32; num_chunks * SLOTS * EMBEDDING_DIM];
-    // One chunk's worth of output frames, all count 0 (no active
-    // speakers). `diarize_offline`'s reconstruct stage requires
-    // `num_output_frames >= FRAMES_PER_WINDOW` for a single chunk, so a
-    // 1-frame count is rejected before the clustering fast path; size
-    // it to the chunk's frame count to exercise the all-silent path.
-    let count = vec![0_u8; FRAMES_PER_WINDOW];
     let chunk_dur = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
     let chunks_sw = SlidingWindow::new(0.0, chunk_dur, 1.0);
     let frames_sw = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
+    // `count` length must be the EXACT pyannote output-frame count for
+    // this geometry (594 for one 10 s chunk at the community-1 frame
+    // step) — the value `build_range` produces and `RangeEmbeddings`
+    // now validates. The previous hardcoded `FRAMES_PER_WINDOW` (589)
+    // was a too-short count that only slipped through the unvalidated
+    // constructor. All-zero contents still exercise the all-silent
+    // path.
+    let num_output_frames = crate::aggregate::num_output_frames_pyannote(
+      num_chunks,
+      chunk_dur,
+      chunks_sw.step(),
+      frames_sw.step(),
+    );
+    let count = vec![0_u8; num_output_frames];
     let range =
       crate::streaming::RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw, frames_sw)
         .expect("carrier");
