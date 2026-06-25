@@ -31,7 +31,14 @@
 mod offline_diarizer;
 mod range;
 
+#[cfg(feature = "ort")]
+mod embedder;
+
 pub use offline_diarizer::{
   DiarizedSpan, StreamingError, StreamingOfflineDiarizer, StreamingOfflineOptions,
 };
 pub use range::{RangeEmbeddings, RangeShapeError};
+
+#[cfg(feature = "ort")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ort")))]
+pub use embedder::StreamingEmbedder;

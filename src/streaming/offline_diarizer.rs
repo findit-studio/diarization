@@ -321,231 +321,14 @@ impl StreamingOfflineDiarizer {
     abs_start_sample: u64,
     samples: &[f32],
   ) -> Result<(), StreamingError> {
-    let cfg = &self.options.diarization;
-    if samples.is_empty() {
-      return Err(StreamingShapeError::EmptyVoiceRange.into());
-    }
-    let win = WINDOW_SAMPLES as usize;
-    let step = cfg.step_samples() as usize;
-    if step == 0 {
-      return Err(StreamingShapeError::ZeroStepSamples.into());
-    }
-    // Defense-in-depth: `OwnedPipelineOptions::with_step_samples`
-    // panics on > WINDOW_SAMPLES, but serde-deserialized configs
-    // bypass that path. See StreamingShapeError::StepSamplesExceedsWindow.
-    if step > win {
-      return Err(
-        StreamingShapeError::StepSamplesExceedsWindow {
-          step: cfg.step_samples(),
-          window: WINDOW_SAMPLES,
-        }
-        .into(),
-      );
-    }
-    // Same defense-in-depth for onset.
-    if !crate::offline::check_onset(cfg.onset()) {
-      return Err(StreamingShapeError::OnsetOutOfRange { onset: cfg.onset() }.into());
-    }
-    if !crate::offline::check_min_duration_off(cfg.min_duration_off()) {
-      return Err(
-        StreamingShapeError::MinDurationOffOutOfRange {
-          value: cfg.min_duration_off(),
-        }
-        .into(),
-      );
-    }
-    if !crate::offline::check_smoothing_epsilon(cfg.smoothing_epsilon()) {
-      return Err(
-        StreamingShapeError::SmoothingEpsilonOutOfRange {
-          value: cfg.smoothing_epsilon(),
-        }
-        .into(),
-      );
-    }
-    // Preflight clustering hyperparameters BEFORE running per-range
-    // segmentation + embedding inference. `finalize` re-validates,
-    // but a misconfigured `threshold`/`fa`/`fb`/`max_iters` would
-    // otherwise burn every range's model-inference pass before
-    // failing at the global clustering boundary. Surface the error
-    // upfront on the first `push_voice_range` call.
-    if !cfg.threshold().is_finite() || cfg.threshold() <= 0.0 {
-      return Err(
-        StreamingShapeError::InvalidThreshold {
-          value: cfg.threshold(),
-        }
-        .into(),
-      );
-    }
-    if !cfg.fa().is_finite() || cfg.fa() <= 0.0 {
-      return Err(StreamingShapeError::InvalidFa { value: cfg.fa() }.into());
-    }
-    if !cfg.fb().is_finite() || cfg.fb() <= 0.0 {
-      return Err(StreamingShapeError::InvalidFb { value: cfg.fb() }.into());
-    }
-    if cfg.max_iters() == 0 {
-      return Err(StreamingShapeError::ZeroMaxIters.into());
-    }
-    if cfg.max_iters() > crate::cluster::vbx::MAX_ITERS_CAP {
-      return Err(
-        StreamingShapeError::MaxItersExceedsCap {
-          got: cfg.max_iters(),
-          cap: crate::cluster::vbx::MAX_ITERS_CAP,
-        }
-        .into(),
-      );
-    }
-
-    let num_chunks = if samples.len() <= win {
-      1
-    } else {
-      (samples.len() - win).div_ceil(step) + 1
-    };
-
-    let mut padded_chunk = vec![0.0_f32; win];
-    // Spill-back per-range tensors: a single voice range that runs
-    // for hours would otherwise OOM the heap. See
-    // `OwnedDiarizationPipeline::run` for the same pattern.
-    let segs_len = num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
-    let mut segmentations = crate::ops::spill::SpillBytesMut::<f64>::zeros(
-      segs_len,
-      self.options.diarization.spill_options(),
-    )?;
-    {
-      let segs = segmentations.as_mut_slice();
-
-      // ── Stage 1: chunked sliding-window segmentation ───────────────
-      for c in 0..num_chunks {
-        let chunk_start = c * step;
-        padded_chunk.fill(0.0);
-        let end = (chunk_start + win).min(samples.len());
-        let lo = chunk_start.min(samples.len());
-        let n = end - lo;
-        if n > 0 {
-          padded_chunk[..n].copy_from_slice(&samples[lo..end]);
-        }
-
-        let logits = seg_model
-          .infer(&padded_chunk)
-          .map_err(|e| StreamingError::Segment(format!("{e}")))?;
-        for f in 0..FRAMES_PER_WINDOW {
-          let mut row = [0.0_f32; POWERSET_CLASSES];
-          for k in 0..POWERSET_CLASSES {
-            row[k] = logits[f * POWERSET_CLASSES + k];
-          }
-          let probs = softmax_row(&row);
-          // Pyannote's `to_multilabel(soft=False)` — see the long
-          // comment in `crate::offline::owned::OwnedDiarizationPipeline
-          // ::run` stage 1 for the rationale.
-          let speakers = powerset_to_speakers_hard(&probs);
-          for s in 0..SLOTS_PER_CHUNK {
-            segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = speakers[s] as f64;
-          }
-        }
-      }
-    }
-
-    // ── Stage 2: per-(chunk, slot) masked embedding ────────────────
-    let emb_len = num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
-    let mut raw_embeddings = crate::ops::spill::SpillBytesMut::<f32>::zeros(
-      emb_len,
-      self.options.diarization.spill_options(),
-    )?;
-    {
-      let segs = segmentations.as_mut_slice();
-      let embs = raw_embeddings.as_mut_slice();
-
-      for c in 0..num_chunks {
-        let chunk_start = c * step;
-        padded_chunk.fill(0.0);
-        let end = (chunk_start + win).min(samples.len());
-        let lo = chunk_start.min(samples.len());
-        let n = end - lo;
-        if n > 0 {
-          padded_chunk[..n].copy_from_slice(&samples[lo..end]);
-        }
-
-        for s in 0..SLOTS_PER_CHUNK {
-          let mut frame_mask = [false; FRAMES_PER_WINDOW];
-          let mut any_active = false;
-          for f in 0..FRAMES_PER_WINDOW {
-            let active =
-              segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] >= cfg.onset() as f64;
-            frame_mask[f] = active;
-            any_active |= active;
-          }
-          if !any_active {
-            for f in 0..FRAMES_PER_WINDOW {
-              segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
-            }
-            continue;
-          }
-
-          let raw = match embed_model.embed_chunk_with_frame_mask(&padded_chunk, &frame_mask) {
-            Ok(v) => v,
-            Err(crate::embed::Error::InvalidClip { .. })
-            | Err(crate::embed::Error::DegenerateEmbedding) => {
-              for f in 0..FRAMES_PER_WINDOW {
-                segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
-              }
-              continue;
-            }
-            Err(e) => return Err(StreamingError::Embed(format!("{e}"))),
-          };
-          // Reject non-finite embedding output as a hard error. Mirrors
-          // `offline::owned`'s split: NaN/inf is upstream corruption that
-          // must surface, not get silently drop-listed as "inactive
-          // speaker" alongside legitimate low-norm vectors.
-          if raw.iter().any(|v| !v.is_finite()) {
-            return Err(StreamingError::Embed(format!(
-              "{}",
-              crate::embed::Error::NonFiniteOutput
-            )));
-          }
-          let norm_sq: f64 = raw.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
-          if norm_sq.sqrt() < 0.01 {
-            for f in 0..FRAMES_PER_WINDOW {
-              segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
-            }
-            continue;
-          }
-          let dst = (c * SLOTS_PER_CHUNK + s) * EMBEDDING_DIM;
-          embs[dst..dst + EMBEDDING_DIM].copy_from_slice(&raw);
-        }
-      }
-    }
-
-    // ── Stage 3: count tensor (local to this range) ────────────────
-    let chunk_duration_s = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
-    let chunk_step_s = cfg.step_samples() as f64 / SAMPLE_RATE_HZ as f64;
-    let chunks_sw_local = SlidingWindow::new(0.0, chunk_duration_s, chunk_step_s);
-    let frames_sw_template =
-      SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
-    // Use the fallible variant: a malformed `onset` (NaN/inf via the
-    // public `with_onset` builder) would panic the infallible wrapper
-    // at `try_count_pyannote.expect(...)`. Surface it as a typed
-    // `StreamingError::Aggregate` so untrusted config can never crash.
-    let (count, frames_sw_local) = try_count_pyannote(
-      segmentations.as_slice(),
-      num_chunks,
-      FRAMES_PER_WINDOW,
-      SLOTS_PER_CHUNK,
-      cfg.onset() as f64,
-      chunks_sw_local,
-      frames_sw_template,
-      self.options.diarization.spill_options(),
-    )?
-    .into_parts();
-
-    self.ranges.push(RangeEmbeddings::from_validated(
+    let range = build_range(
+      &self.options,
+      seg_model,
+      embed_model,
       abs_start_sample,
-      num_chunks,
-      segmentations.as_slice().to_vec(),
-      raw_embeddings.as_slice().to_vec(),
-      count.to_vec(),
-      chunks_sw_local,
-      frames_sw_local,
-    ));
-
+      samples,
+    )?;
+    self.ranges.push(range);
     Ok(())
   }
 
@@ -582,6 +365,244 @@ impl StreamingOfflineDiarizer {
   pub fn reset(&mut self) {
     self.ranges.clear();
   }
+}
+
+/// Run the fused segmentation + masked-embedding + count pipeline on one
+/// voice range and return the public [`RangeEmbeddings`] carrier. Shared
+/// by [`StreamingOfflineDiarizer::push_voice_range`] (which accumulates
+/// the carrier internally) and
+/// [`crate::streaming::StreamingEmbedder::push`] (which hands it to the
+/// caller). Emits RAW, unnormalized WeSpeaker vectors — never
+/// L2-normalized.
+pub(crate) fn build_range(
+  options: &StreamingOfflineOptions,
+  seg_model: &mut SegmentModel,
+  embed_model: &mut EmbedModel,
+  abs_start_sample: u64,
+  samples: &[f32],
+) -> Result<RangeEmbeddings, StreamingError> {
+  let cfg = options.diarization();
+  if samples.is_empty() {
+    return Err(StreamingShapeError::EmptyVoiceRange.into());
+  }
+  let win = WINDOW_SAMPLES as usize;
+  let step = cfg.step_samples() as usize;
+  if step == 0 {
+    return Err(StreamingShapeError::ZeroStepSamples.into());
+  }
+  // Defense-in-depth: `OwnedPipelineOptions::with_step_samples`
+  // panics on > WINDOW_SAMPLES, but serde-deserialized configs
+  // bypass that path. See StreamingShapeError::StepSamplesExceedsWindow.
+  if step > win {
+    return Err(
+      StreamingShapeError::StepSamplesExceedsWindow {
+        step: cfg.step_samples(),
+        window: WINDOW_SAMPLES,
+      }
+      .into(),
+    );
+  }
+  // Same defense-in-depth for onset.
+  if !crate::offline::check_onset(cfg.onset()) {
+    return Err(StreamingShapeError::OnsetOutOfRange { onset: cfg.onset() }.into());
+  }
+  if !crate::offline::check_min_duration_off(cfg.min_duration_off()) {
+    return Err(
+      StreamingShapeError::MinDurationOffOutOfRange {
+        value: cfg.min_duration_off(),
+      }
+      .into(),
+    );
+  }
+  if !crate::offline::check_smoothing_epsilon(cfg.smoothing_epsilon()) {
+    return Err(
+      StreamingShapeError::SmoothingEpsilonOutOfRange {
+        value: cfg.smoothing_epsilon(),
+      }
+      .into(),
+    );
+  }
+  // Preflight clustering hyperparameters BEFORE running per-range
+  // segmentation + embedding inference. `finalize` re-validates,
+  // but a misconfigured `threshold`/`fa`/`fb`/`max_iters` would
+  // otherwise burn every range's model-inference pass before
+  // failing at the global clustering boundary. Surface the error
+  // upfront on the first `push_voice_range` call.
+  if !cfg.threshold().is_finite() || cfg.threshold() <= 0.0 {
+    return Err(
+      StreamingShapeError::InvalidThreshold {
+        value: cfg.threshold(),
+      }
+      .into(),
+    );
+  }
+  if !cfg.fa().is_finite() || cfg.fa() <= 0.0 {
+    return Err(StreamingShapeError::InvalidFa { value: cfg.fa() }.into());
+  }
+  if !cfg.fb().is_finite() || cfg.fb() <= 0.0 {
+    return Err(StreamingShapeError::InvalidFb { value: cfg.fb() }.into());
+  }
+  if cfg.max_iters() == 0 {
+    return Err(StreamingShapeError::ZeroMaxIters.into());
+  }
+  if cfg.max_iters() > crate::cluster::vbx::MAX_ITERS_CAP {
+    return Err(
+      StreamingShapeError::MaxItersExceedsCap {
+        got: cfg.max_iters(),
+        cap: crate::cluster::vbx::MAX_ITERS_CAP,
+      }
+      .into(),
+    );
+  }
+
+  let num_chunks = if samples.len() <= win {
+    1
+  } else {
+    (samples.len() - win).div_ceil(step) + 1
+  };
+
+  let mut padded_chunk = vec![0.0_f32; win];
+  // Spill-back per-range tensors: a single voice range that runs
+  // for hours would otherwise OOM the heap. See
+  // `OwnedDiarizationPipeline::run` for the same pattern.
+  let segs_len = num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
+  let mut segmentations = crate::ops::spill::SpillBytesMut::<f64>::zeros(
+    segs_len,
+    options.diarization().spill_options(),
+  )?;
+  {
+    let segs = segmentations.as_mut_slice();
+
+    // ── Stage 1: chunked sliding-window segmentation ───────────────
+    for c in 0..num_chunks {
+      let chunk_start = c * step;
+      padded_chunk.fill(0.0);
+      let end = (chunk_start + win).min(samples.len());
+      let lo = chunk_start.min(samples.len());
+      let n = end - lo;
+      if n > 0 {
+        padded_chunk[..n].copy_from_slice(&samples[lo..end]);
+      }
+
+      let logits = seg_model
+        .infer(&padded_chunk)
+        .map_err(|e| StreamingError::Segment(format!("{e}")))?;
+      for f in 0..FRAMES_PER_WINDOW {
+        let mut row = [0.0_f32; POWERSET_CLASSES];
+        for k in 0..POWERSET_CLASSES {
+          row[k] = logits[f * POWERSET_CLASSES + k];
+        }
+        let probs = softmax_row(&row);
+        // Pyannote's `to_multilabel(soft=False)` — see the long
+        // comment in `crate::offline::owned::OwnedDiarizationPipeline
+        // ::run` stage 1 for the rationale.
+        let speakers = powerset_to_speakers_hard(&probs);
+        for s in 0..SLOTS_PER_CHUNK {
+          segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = speakers[s] as f64;
+        }
+      }
+    }
+  }
+
+  // ── Stage 2: per-(chunk, slot) masked embedding ────────────────
+  let emb_len = num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
+  let mut raw_embeddings =
+    crate::ops::spill::SpillBytesMut::<f32>::zeros(emb_len, options.diarization().spill_options())?;
+  {
+    let segs = segmentations.as_mut_slice();
+    let embs = raw_embeddings.as_mut_slice();
+
+    for c in 0..num_chunks {
+      let chunk_start = c * step;
+      padded_chunk.fill(0.0);
+      let end = (chunk_start + win).min(samples.len());
+      let lo = chunk_start.min(samples.len());
+      let n = end - lo;
+      if n > 0 {
+        padded_chunk[..n].copy_from_slice(&samples[lo..end]);
+      }
+
+      for s in 0..SLOTS_PER_CHUNK {
+        let mut frame_mask = [false; FRAMES_PER_WINDOW];
+        let mut any_active = false;
+        for f in 0..FRAMES_PER_WINDOW {
+          let active =
+            segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] >= cfg.onset() as f64;
+          frame_mask[f] = active;
+          any_active |= active;
+        }
+        if !any_active {
+          for f in 0..FRAMES_PER_WINDOW {
+            segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
+          }
+          continue;
+        }
+
+        let raw = match embed_model.embed_chunk_with_frame_mask(&padded_chunk, &frame_mask) {
+          Ok(v) => v,
+          Err(crate::embed::Error::InvalidClip { .. })
+          | Err(crate::embed::Error::DegenerateEmbedding) => {
+            for f in 0..FRAMES_PER_WINDOW {
+              segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
+            }
+            continue;
+          }
+          Err(e) => return Err(StreamingError::Embed(format!("{e}"))),
+        };
+        // Reject non-finite embedding output as a hard error. Mirrors
+        // `offline::owned`'s split: NaN/inf is upstream corruption that
+        // must surface, not get silently drop-listed as "inactive
+        // speaker" alongside legitimate low-norm vectors.
+        if raw.iter().any(|v| !v.is_finite()) {
+          return Err(StreamingError::Embed(format!(
+            "{}",
+            crate::embed::Error::NonFiniteOutput
+          )));
+        }
+        let norm_sq: f64 = raw.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        if norm_sq.sqrt() < 0.01 {
+          for f in 0..FRAMES_PER_WINDOW {
+            segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
+          }
+          continue;
+        }
+        let dst = (c * SLOTS_PER_CHUNK + s) * EMBEDDING_DIM;
+        embs[dst..dst + EMBEDDING_DIM].copy_from_slice(&raw);
+      }
+    }
+  }
+
+  // ── Stage 3: count tensor (local to this range) ────────────────
+  let chunk_duration_s = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
+  let chunk_step_s = cfg.step_samples() as f64 / SAMPLE_RATE_HZ as f64;
+  let chunks_sw_local = SlidingWindow::new(0.0, chunk_duration_s, chunk_step_s);
+  let frames_sw_template =
+    SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
+  // Use the fallible variant: a malformed `onset` (NaN/inf via the
+  // public `with_onset` builder) would panic the infallible wrapper
+  // at `try_count_pyannote.expect(...)`. Surface it as a typed
+  // `StreamingError::Aggregate` so untrusted config can never crash.
+  let (count, frames_sw_local) = try_count_pyannote(
+    segmentations.as_slice(),
+    num_chunks,
+    FRAMES_PER_WINDOW,
+    SLOTS_PER_CHUNK,
+    cfg.onset() as f64,
+    chunks_sw_local,
+    frames_sw_template,
+    options.diarization().spill_options(),
+  )?
+  .into_parts();
+
+  Ok(RangeEmbeddings::from_validated(
+    abs_start_sample,
+    num_chunks,
+    segmentations.as_slice().to_vec(),
+    raw_embeddings.as_slice().to_vec(),
+    count.to_vec(),
+    chunks_sw_local,
+    frames_sw_local,
+  ))
 }
 
 /// Shared cluster-and-reconstruct core used by both
