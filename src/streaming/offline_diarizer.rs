@@ -172,6 +172,23 @@ pub enum StreamingShapeError {
     /// `"raw_embeddings"` / `"output_frames"`).
     what: &'static str,
   },
+  /// A per-range scratch-buffer length overflowed `usize` in
+  /// `build_range`. `num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK`
+  /// (segmentations) or `num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`
+  /// (raw embeddings) exceeded `usize::MAX`. Practically unreachable
+  /// (it needs a `num_chunks` that only a >10^15-sample input could
+  /// produce), but plain `*` would wrap in release and silently
+  /// under-allocate the `SpillBytesMut` scratch the fill loop then
+  /// writes past; reject it as a typed error for parity with the
+  /// carrier/cluster boundaries.
+  #[error("per-range {what} scratch length overflows usize for num_chunks {num_chunks}")]
+  RangeShapeOverflow {
+    /// `num_chunks` that triggered the overflow.
+    num_chunks: usize,
+    /// Which product overflowed (`"segmentations"` /
+    /// `"raw_embeddings"`).
+    what: &'static str,
+  },
 }
 
 /// Configuration for [`StreamingOfflineDiarizer`].
@@ -478,8 +495,17 @@ pub(crate) fn build_range(
   let mut padded_chunk = vec![0.0_f32; win];
   // Spill-back per-range tensors: a single voice range that runs
   // for hours would otherwise OOM the heap. See
-  // `OwnedDiarizationPipeline::run` for the same pattern.
-  let segs_len = num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
+  // `OwnedDiarizationPipeline::run` for the same pattern. Checked
+  // shape arithmetic for parity with the carrier/cluster boundaries:
+  // a wrapped `segs_len` would under-allocate the scratch the fill
+  // loop below then writes past.
+  let segs_len = num_chunks
+    .checked_mul(FRAMES_PER_WINDOW)
+    .and_then(|n| n.checked_mul(SLOTS_PER_CHUNK))
+    .ok_or(StreamingShapeError::RangeShapeOverflow {
+      num_chunks,
+      what: "segmentations",
+    })?;
   let mut segmentations = crate::ops::spill::SpillBytesMut::<f64>::zeros(
     segs_len,
     options.diarization().spill_options(),
@@ -519,7 +545,13 @@ pub(crate) fn build_range(
   }
 
   // ── Stage 2: per-(chunk, slot) masked embedding ────────────────
-  let emb_len = num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
+  let emb_len = num_chunks
+    .checked_mul(SLOTS_PER_CHUNK)
+    .and_then(|n| n.checked_mul(EMBEDDING_DIM))
+    .ok_or(StreamingShapeError::RangeShapeOverflow {
+      num_chunks,
+      what: "raw_embeddings",
+    })?;
   let mut raw_embeddings =
     crate::ops::spill::SpillBytesMut::<f32>::zeros(emb_len, options.diarization().spill_options())?;
   {
