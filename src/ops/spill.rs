@@ -834,6 +834,32 @@ impl<T> Clone for SpillBytes<T> {
 }
 
 impl<T: Pod> SpillBytes<T> {
+  /// Wrap an owned heap `Vec<T>` as a heap-backed [`SpillBytes`].
+  ///
+  /// The result is always the `Heap` backend
+  /// ([`is_mmapped`](Self::is_mmapped) is `false`). `Arc::<[T]>::from`
+  /// reuses the `Vec`'s buffer in place when its length equals its
+  /// capacity (the common case for a fully-built tensor), so this is
+  /// the cheap bridge for a call site that already owns a heap `Vec`
+  /// and needs the spill-capable carrier type — no round-trip through
+  /// [`SpillBytesMut::zeros`] + `copy_from_slice`.
+  ///
+  /// Used at the public `RangeEmbeddings::new` boundary, where the
+  /// caller supplies owned `Vec`s built from raw model output: that
+  /// path is already heap-resident, so nothing is gained by spilling
+  /// it to mmap. The internal `build_range` path instead `freeze`s its
+  /// existing `SpillBytesMut`, so long ranges retain their mmap
+  /// backing all the way through the carrier.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn from_vec(v: Vec<T>) -> Self {
+    let len = v.len();
+    Self {
+      data: SpillBytesData::Heap(Arc::from(v)),
+      len,
+      _phantom: PhantomData,
+    }
+  }
+
   /// Number of `T` cells in the buffer.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn len(&self) -> usize {

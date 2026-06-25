@@ -594,12 +594,21 @@ pub(crate) fn build_range(
   )?
   .into_parts();
 
-  Ok(RangeEmbeddings::from_validated(
+  // Freeze the spill-backed scratch buffers into the carrier instead
+  // of `to_vec`-ing them onto the heap. `freeze` is zero-copy on both
+  // backends (heap moves the refcount-1 `Arc<[T]>`; mmap wraps the
+  // existing mapping in an `Arc`), so a multi-hour voice range whose
+  // `segmentations` / `raw_embeddings` spilled to a file-backed mmap
+  // stays file-backed all the way through `RangeEmbeddings` — both the
+  // bundled `StreamingOfflineDiarizer` (which stores the carrier) and
+  // the split `cluster_ranges` path retain it without an unbounded
+  // heap copy. `count` is already `Arc<[u8]>` from `count_pyannote`.
+  Ok(RangeEmbeddings::from_spill_parts(
     abs_start_sample,
     num_chunks,
-    segmentations.as_slice().to_vec(),
-    raw_embeddings.as_slice().to_vec(),
-    count.to_vec(),
+    segmentations.freeze(),
+    raw_embeddings.freeze(),
+    count,
     chunks_sw_local,
     frames_sw_local,
   ))
