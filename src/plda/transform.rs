@@ -176,7 +176,7 @@ impl RawEmbedding {
   /// `normalized_vs_raw_input_produce_materially_different_output` in
   /// `src/plda/tests.rs`).
   ///
-  /// Validation is identical to the internal [`Self::from_raw_array`]:
+  /// Validation is identical to the internal `from_raw_array`:
   /// rejects non-finite values ([`Error::NonFiniteInput`]) and
   /// below-`RAW_EMBEDDING_MIN_NORM` degenerate output
   /// ([`Error::DegenerateInput`]).
