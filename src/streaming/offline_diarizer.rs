@@ -895,22 +895,13 @@ mod refactor_tests {
     let chunk_dur = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
     let chunks_sw = SlidingWindow::new(0.0, chunk_dur, 1.0);
     let frames_sw = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
-    // `count` length must be the EXACT pyannote output-frame count for
-    // this geometry (594 for one 10 s chunk at the community-1 frame
-    // step) — the value `build_range` produces and `RangeEmbeddings`
-    // now validates. The previous hardcoded `FRAMES_PER_WINDOW` (589)
-    // was a too-short count that only slipped through the unvalidated
-    // constructor. All-zero contents still exercise the all-silent
-    // path.
-    let num_output_frames = crate::aggregate::num_output_frames_pyannote(
-      num_chunks,
-      chunk_dur,
-      chunks_sw.step(),
-      frames_sw.step(),
-    );
-    let count = vec![0_u8; num_output_frames];
+    // The public `new` DERIVES the count from these (all-zero)
+    // segmentations — it no longer accepts a caller-supplied count — so
+    // the carrier carries the exact pyannote output-frame count (594 for
+    // one 10 s chunk at the community-1 frame step), all-zero, exercising
+    // the all-silent path with no chance of a forged count.
     let range =
-      crate::streaming::RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw, frames_sw)
+      crate::streaming::RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw, frames_sw)
         .expect("carrier");
     let spans = cluster_ranges_inner(&[range], &opts, &plda).expect("cluster ok");
     assert_eq!(spans.len(), 0, "all-silent range yields no spans");

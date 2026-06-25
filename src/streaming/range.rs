@@ -4,13 +4,26 @@
 use std::sync::Arc;
 
 use crate::{
-  aggregate::try_num_output_frames_pyannote, embed::EMBEDDING_DIM, ops::spill::SpillBytes,
-  reconstruct::SlidingWindow, segment::FRAMES_PER_WINDOW,
+  aggregate::try_count_pyannote,
+  embed::EMBEDDING_DIM,
+  ops::spill::{SpillBytes, SpillOptions},
+  reconstruct::SlidingWindow,
+  segment::FRAMES_PER_WINDOW,
 };
 
 /// Speaker slots per chunk (pyannote powerset = 3). Local copy for
 /// module independence; equals [`crate::offline::SLOTS_PER_CHUNK`].
 const SLOTS_PER_CHUNK: usize = 3;
+
+/// Frame-binarization onset the public [`RangeEmbeddings::new`] derives
+/// `count` with — the pyannote community-1 default (`0.5`, matching
+/// [`crate::offline::OwnedPipelineOptions`] and the `build_range`
+/// internal path). The carrier contract requires `segmentations` to be
+/// **hard 0/1** activity, so the derived count is onset-independent for
+/// any threshold in `(0, 1]`; `0.5` is the canonical pyannote value and
+/// keeps the public-boundary derivation byte-identical to the count the
+/// internal path produces from the same hard segmentations.
+const DERIVE_ONSET: f64 = 0.5;
 
 /// Shape-violation reasons for [`RangeEmbeddings::new`].
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq)]
@@ -59,11 +72,12 @@ pub enum RangeShapeError {
   /// A `SlidingWindow` start offset is not the local origin (`0.0`)
   /// the split protocol requires. `build_range` always emits both
   /// `chunks_sw` and `frames_sw` with `start == 0.0`, and the count
-  /// derivation ([`aggregate::try_num_output_frames_pyannote`]) plus
+  /// derivation (`aggregate::try_count_pyannote`, whose internal
+  /// output-frame-count formula takes only `duration`/`step`) plus
   /// reconstruct's overlap-add (`chunk_start_time = chunks_sw.start +
   /// c * chunks_sw.step`, `closest_frame` subtracts `frames_sw.start`)
   /// both bake in that origin. A non-zero start is NOT reflected in the
-  /// count length (the helper takes only `duration`/`step`), yet
+  /// count length (the formula takes only `duration`/`step`), yet
   /// reconstruct honours it — so reconstruction emits every span offset
   /// by `start * SR` BEFORE `abs_start_sample` is added, silently
   /// shifting the whole range off its true timeline. Reject it at the
@@ -103,51 +117,52 @@ pub enum RangeShapeError {
   /// output-frame count — the count overflows `usize` or exceeds the
   /// [`MAX_OUTPUT_FRAMES`](crate::aggregate::MAX_OUTPUT_FRAMES) cap (an
   /// extreme `chunk_duration / frame_step` whose product saturates the
-  /// frame-count computation). The expected `count` length is derived
-  /// from this geometry via the same
-  /// `aggregate::try_num_output_frames_pyannote` helper the count-tensor
-  /// stage uses, so an underivable count makes the length uncheckable;
-  /// reject it here rather than letting the carrier through with an
-  /// unvalidatable `count`.
+  /// frame-count computation). The public boundary DERIVES `count` from
+  /// this geometry via `aggregate::try_count_pyannote`, so a geometry
+  /// whose output-frame count is underivable cannot produce a count at
+  /// all; reject it here rather than letting the carrier through.
   #[error(
     "chunks_sw/frames_sw geometry: cannot derive the pyannote output-frame count \
      (count overflows usize or exceeds MAX_OUTPUT_FRAMES)"
   )]
   InvalidGeometry,
-  /// `count.len()` does not equal the exact pyannote output-frame
-  /// count derived from `num_chunks` + `chunks_sw` + `frames_sw`.
+  /// `segmentations` contains a non-finite value (NaN / +inf / -inf).
   ///
-  /// `cluster_ranges_inner` treats `count.len()` as the authoritative
-  /// `num_output_frames` for the range's reconstruct stage: a
-  /// too-long `count` with positive trailing values makes reconstruct
-  /// fabricate/extend spans beyond the audio, while a too-short one
-  /// silently truncates trailing frames. Both must be rejected at the
-  /// public boundary, not surfaced (or hidden) later.
-  #[error(
-    "count.len() {got} must equal the pyannote output-frame count for num_chunks/chunks_sw/frames_sw = {expected}"
-  )]
-  CountLenMismatch {
-    /// Expected length (exact pyannote `num_output_frames`).
-    expected: usize,
-    /// Actual length.
-    got: usize,
-  },
+  /// The public constructor DERIVES `count` from `segmentations` (it no
+  /// longer trusts a caller-supplied count — see [`RangeEmbeddings::new`]);
+  /// the derivation thresholds each cell against the onset, a comparison
+  /// that is asymmetric on non-finite inputs (NaN/-inf compare false,
+  /// +inf compares true), so a degraded segmentation backend emitting
+  /// NaN/inf would silently fold into a finite-looking count. Reject it
+  /// at the boundary — the same policy `aggregate::try_count_pyannote`
+  /// and `reconstruct` apply to the segmentation tensor.
+  #[error("segmentations contains a non-finite value (NaN / +inf / -inf)")]
+  NonFiniteSegmentations,
+  /// Deriving `count` from `segmentations` failed to allocate its
+  /// spill-backed scratch buffers (`aggregate::try_count_pyannote`
+  /// reserves two `num_output_frames`-long f64 working buffers that may
+  /// spill to a tempfile/mmap). A storage/allocation failure surfaces
+  /// here as a typed boundary error rather than an opaque panic.
+  #[error("failed to derive count from segmentations (scratch allocation failed)")]
+  CountDerivationFailed,
 }
 
 /// Validate the COMPLETE `SlidingWindow` geometry contract the split
-/// protocol requires, BEFORE deriving the expected `count` length.
+/// protocol requires, BEFORE deriving the `count` from the
+/// segmentations + geometry.
 ///
-/// The count derivation ([`try_num_output_frames_pyannote`]) only
-/// inspects `chunks_sw.duration`, `chunks_sw.step`, and
-/// `frames_sw.step` — it drops both `start` offsets and never sees
-/// `frames_sw.duration`. But reconstruct (`cluster_ranges_inner` ->
-/// `reconstruct`) consumes ALL six scalars: its overlap-add computes
-/// `chunk_start_time = chunks_sw.start + c * chunks_sw.step` and
-/// `closest_frame(t) = round((t - frames_sw.start - frames_sw.duration
-/// / 2) / frames_sw.step)`. So a window that satisfies the count helper
-/// can still be geometrically inconsistent with the count it produced —
-/// e.g. a non-zero `chunks_sw.start` leaves the count length unchanged
-/// yet shifts every reconstructed span. Enforce the full contract here.
+/// The count derivation's internal output-frame-count formula (inside
+/// `aggregate::try_count_pyannote`) only inspects `chunks_sw.duration`,
+/// `chunks_sw.step`, and `frames_sw.step` — it drops both `start`
+/// offsets and never sees `frames_sw.duration`. But reconstruct
+/// (`cluster_ranges_inner` -> `reconstruct`) consumes ALL six scalars:
+/// its overlap-add computes `chunk_start_time = chunks_sw.start + c *
+/// chunks_sw.step` and `closest_frame(t) = round((t - frames_sw.start -
+/// frames_sw.duration / 2) / frames_sw.step)`. So a window that
+/// satisfies the count formula can still be geometrically inconsistent
+/// with the count it produced — e.g. a non-zero `chunks_sw.start`
+/// leaves the count length unchanged yet shifts every reconstructed
+/// span. Enforce the full contract here.
 ///
 /// Invariants enforced (exactly what `build_range` guarantees and what
 /// reconstruct / `try_count_pyannote` assume):
@@ -189,36 +204,76 @@ fn validate_geometry(
   Ok(())
 }
 
-/// Compute the exact pyannote `num_output_frames` for one range from
-/// the same geometry the count-tensor aggregation uses, so the
-/// `count` length can be validated at the carrier boundary against the
-/// authoritative value `cluster_ranges_inner` will later assume.
+/// DERIVE the per-output-frame `count` for one range from its
+/// `segmentations` + geometry, using the SAME
+/// [`aggregate::try_count_pyannote`](crate::aggregate::try_count_pyannote)
+/// helper the internal `build_range` path uses — so the public boundary
+/// produces a count that is consistent-by-construction with the
+/// segmentations this carrier also stores, rather than trusting a
+/// caller-supplied one.
 ///
-/// Mirrors `aggregate::try_count_pyannote`'s internal derivation:
-/// `chunk_duration = chunks_sw.duration()`, `chunk_step =
-/// chunks_sw.step()`, `frame_step = frames_sw.step()`, fed to
-/// [`try_num_output_frames_pyannote`]. Reusing that helper (rather than
-/// reimplementing the `round(last_chunk_end / frame_step) + 1`
-/// geometry) keeps the carrier's accepted `count` length in lockstep
-/// with what `build_range` produces and what reconstruct consumes.
+/// This is the structural fix for the count-forgery class: `count` is
+/// always a function of `segmentations`, so a caller can no longer pass
+/// all-zero segmentations alongside a fabricated all-one count to
+/// conjure speaker spans from silence. An all-zero (silent)
+/// segmentation derives an all-zero count of the exact pyannote
+/// `num_output_frames` length; reconstruct then emits no spans.
 ///
-/// [`validate_geometry`] must run first: it guarantees the
-/// start/duration/step invariants this helper's caller relies on, so
-/// here a remaining error means only an overflow / above-cap
-/// output-frame count (the `chunk_duration / frame_step` saturation
-/// case), surfaced as [`RangeShapeError::InvalidGeometry`].
-fn expected_count_len(
+/// [`validate_geometry`] must run first (it guarantees the
+/// start/duration/step invariants), and the segmentations-length check
+/// must already have passed (fixed `FRAMES_PER_WINDOW` /
+/// [`SLOTS_PER_CHUNK`]). With those satisfied, the only residual
+/// failures are:
+/// - a non-finite segmentation cell → [`RangeShapeError::NonFiniteSegmentations`]
+///   (checked here directly so the precise typed error does not depend on
+///   `aggregate`'s non-re-exported inner `ShapeError`);
+/// - a geometry whose derived output-frame count overflows / exceeds the
+///   cap → [`RangeShapeError::InvalidGeometry`];
+/// - a spill scratch-allocation failure → [`RangeShapeError::CountDerivationFailed`].
+///
+/// The onset is the canonical [`DERIVE_ONSET`]; because the carrier
+/// contract requires hard-0/1 segmentations, the derived count is
+/// onset-independent and byte-identical to the count `build_range`
+/// produces from the same hard segmentations.
+fn derive_count(
+  segmentations: &[f64],
   num_chunks: usize,
   chunks_sw: SlidingWindow,
   frames_sw: SlidingWindow,
-) -> Result<usize, RangeShapeError> {
-  try_num_output_frames_pyannote(
+) -> Result<Arc<[u8]>, RangeShapeError> {
+  // Reject non-finite segmentation cells up front with the precise
+  // typed error. `try_count_pyannote` rejects them too, but its inner
+  // `ShapeError` is not re-exported from `aggregate`, so we cannot
+  // name that variant when mapping its error; checking here keeps the
+  // boundary error specific without widening another module's API.
+  if segmentations.iter().any(|v| !v.is_finite()) {
+    return Err(RangeShapeError::NonFiniteSegmentations);
+  }
+  try_count_pyannote(
+    segmentations,
     num_chunks,
-    chunks_sw.duration(),
-    chunks_sw.step(),
-    frames_sw.step(),
+    FRAMES_PER_WINDOW,
+    SLOTS_PER_CHUNK,
+    DERIVE_ONSET,
+    chunks_sw,
+    frames_sw,
+    &SpillOptions::default(),
   )
-  .map_err(|_| RangeShapeError::InvalidGeometry)
+  .map(|t| t.into_parts().0)
+  .map_err(|e| match e {
+    // Spill scratch-buffer allocation failure during the derivation.
+    crate::aggregate::Error::Spill(_) => RangeShapeError::CountDerivationFailed,
+    // Every `ShapeError` reachable here is precluded by this caller's
+    // prior checks (`num_chunks != 0`, `validate_geometry`, the
+    // exact-length check, fixed positive `FRAMES_PER_WINDOW` /
+    // `SLOTS_PER_CHUNK`, finite `DERIVE_ONSET`, the finite-segmentation
+    // check above) EXCEPT an output-frame count that overflows or
+    // exceeds `MAX_OUTPUT_FRAMES` for an otherwise-valid-looking but
+    // saturating geometry — the residual `InvalidGeometry` case. Map
+    // the whole shape residue to `InvalidGeometry` so the boundary
+    // stays panic-free even if an upstream precondition were relaxed.
+    crate::aggregate::Error::Shape(_) => RangeShapeError::InvalidGeometry,
+  })
 }
 
 /// One VAD voice range's derived diarization tensors, the unit a
@@ -262,24 +317,33 @@ pub struct RangeEmbeddings {
 
 impl RangeEmbeddings {
   /// Construct from a range's derived tensors, validating the flattened
-  /// lengths against `num_chunks` and the `count` length against the
-  /// exact pyannote output-frame geometry.
+  /// lengths against `num_chunks` and the full sliding-window geometry,
+  /// then DERIVING the per-output-frame `count` from `segmentations`.
+  ///
+  /// **`count` is derived, never trusted.** This constructor does NOT
+  /// take a caller-supplied count. It computes the count from
+  /// `segmentations` via the same
+  /// [`aggregate::try_count_pyannote`](crate::aggregate::try_count_pyannote)
+  /// helper the internal `build_range` path uses, so the count is a pure
+  /// function of the segmentations this carrier also stores. This makes
+  /// the count-forgery class unrepresentable: a caller can no longer pass
+  /// all-zero (silent) segmentations alongside a fabricated all-one count
+  /// to conjure speaker spans from silence — the derived count for silent
+  /// segmentations is all-zero, and reconstruct emits no spans. (The
+  /// segmentations are the protocol's source of truth: self-consistent by
+  /// definition, and the count, the masked-speaker selection, and frame
+  /// reconstruction are all functions of them.)
   ///
   /// - `abs_start_sample`: absolute sample index where this range
   ///   starts in the original stream (used to re-anchor output spans).
   /// - `num_chunks`: number of 10 s segmentation chunks in this range.
   /// - `segmentations`: hard 0/1 activity, flattened
   ///   `[chunk][frame][slot]`, length
-  ///   `num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK`.
+  ///   `num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK`. The count is
+  ///   derived from these, so they must be finite (NaN / ±inf rejected).
   /// - `raw_embeddings`: raw WeSpeaker vectors, flattened
   ///   `[chunk][slot][dim]`, length
   ///   `num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`.
-  /// - `count`: per-output-frame speaker count (from
-  ///   `aggregate::count_pyannote`). Its length must equal the exact
-  ///   pyannote `num_output_frames` for `num_chunks` + `chunks_sw` +
-  ///   `frames_sw` — `cluster_ranges_inner` treats `count.len()` as
-  ///   the authoritative output-frame count, so a too-long or
-  ///   too-short `count` is rejected here.
   /// - `chunks_sw` / `frames_sw`: local (range-start = 0) timing.
   ///
   /// The owned `Vec`s are wrapped as heap-backed [`SpillBytes`]
@@ -294,15 +358,17 @@ impl RangeEmbeddings {
   /// window duration or step is non-finite / non-positive
   /// ([`NonPositiveWindowParameter`](RangeShapeError::NonPositiveWindowParameter)),
   /// the derived output-frame count overflows or exceeds the cap
-  /// ([`InvalidGeometry`](RangeShapeError::InvalidGeometry)), or
-  /// `count.len()` does not equal the derived output-frame count.
+  /// ([`InvalidGeometry`](RangeShapeError::InvalidGeometry)),
+  /// `segmentations` contains a non-finite cell
+  /// ([`NonFiniteSegmentations`](RangeShapeError::NonFiniteSegmentations)),
+  /// or the count derivation's scratch allocation fails
+  /// ([`CountDerivationFailed`](RangeShapeError::CountDerivationFailed)).
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     abs_start_sample: u64,
     num_chunks: usize,
     segmentations: Vec<f64>,
     raw_embeddings: Vec<f32>,
-    count: Vec<u8>,
     chunks_sw: SlidingWindow,
     frames_sw: SlidingWindow,
   ) -> Result<Self, RangeShapeError> {
@@ -348,37 +414,48 @@ impl RangeEmbeddings {
     // span. Reject the full protocol contract here so a malformed or
     // version-skewed payload can never reach clustering.
     validate_geometry(chunks_sw, frames_sw)?;
-    // Validate `count.len()` against the EXACT pyannote output-frame
-    // count derived from the same geometry the aggregation uses.
-    // Replaces the prior empty-only check: that let a too-long count
-    // (with positive trailing values) make reconstruct fabricate spans
-    // and a too-short count truncate, neither caught at this boundary.
-    let expected_count = expected_count_len(num_chunks, chunks_sw, frames_sw)?;
-    if count.len() != expected_count {
-      return Err(RangeShapeError::CountLenMismatch {
-        expected: expected_count,
-        got: count.len(),
-      });
-    }
+    // DERIVE `count` from `segmentations` instead of trusting a
+    // caller-supplied one. The prior design accepted a `count` argument
+    // and only validated its LENGTH against the geometry — but length
+    // doesn't prove the count was derived from THESE segmentations, so a
+    // caller could pass all-zero segmentations + an exact-length all-one
+    // count and fabricate speaker spans from silence (the count-forgery
+    // class). Computing the count here from the segmentations via the
+    // same helper `build_range` uses makes count a pure function of the
+    // segmentations this carrier also stores, so forgery is
+    // unrepresentable. (`derive_count` runs after `validate_geometry`,
+    // which guarantees the geometry invariants the derivation relies on.)
+    let count = derive_count(&segmentations, num_chunks, chunks_sw, frames_sw)?;
     Ok(Self {
       abs_start_sample,
       num_chunks,
       segmentations: SpillBytes::from_vec(segmentations),
       raw_embeddings: SpillBytes::from_vec(raw_embeddings),
-      count: Arc::from(count),
+      count,
       chunks_sw,
       frames_sw,
     })
   }
 
-  /// Construct from already-spill-backed buffers without re-validating
-  /// shapes. Used by [`crate::streaming::offline_diarizer::build_range`],
-  /// which builds the tensors itself (enforcing the length invariants
-  /// by construction) as `SpillBytes` — so this path keeps long ranges
-  /// file-backed instead of `to_vec`-ing them onto the heap.
+  /// Clearly-internal, UNCHECKED constructor: build the carrier from
+  /// already-spill-backed buffers and a PRE-COMPUTED `count`, without
+  /// re-validating shapes and WITHOUT re-deriving the count. Used ONLY
+  /// by [`crate::streaming::offline_diarizer::build_range`], which builds
+  /// the segmentations itself (enforcing the length invariants by
+  /// construction) and derives `count` from those SAME segmentations via
+  /// `aggregate::try_count_pyannote` — so the count is consistent with
+  /// the segmentations by construction on this hot path, and re-deriving
+  /// it in the public [`new`](Self::new) sense would be redundant work.
   ///
-  /// `count` arrives as `Arc<[u8]>` straight from
-  /// `aggregate::count_pyannote`, avoiding a copy.
+  /// This is the byte-identical path the desktop split-parity flow takes
+  /// (`StreamingEmbedder::push` → `build_range` → here); the public
+  /// `new` derives the same count from the same segmentations, so the two
+  /// paths agree element-for-element for valid input.
+  ///
+  /// Keeping the tensors as `SpillBytes` lets a multi-hour range stay
+  /// file-backed instead of `to_vec`-ing it onto the heap. `count`
+  /// arrives as `Arc<[u8]>` straight from `aggregate::count_pyannote`,
+  /// avoiding a copy.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn from_spill_parts(
     abs_start_sample: u64,
@@ -452,9 +529,14 @@ mod tests {
   }
 
   /// The exact pyannote output-frame count for `num_chunks` under the
-  /// test geometry — the only `count` length `new` now accepts.
+  /// test geometry — the length `new` now DERIVES the count to.
   fn count_len(num_chunks: usize) -> usize {
-    expected_count_len(num_chunks, chunks_sw(), frames_sw()).expect("valid geometry")
+    crate::aggregate::num_output_frames_pyannote(
+      num_chunks,
+      chunks_sw().duration(),
+      chunks_sw().step(),
+      frames_sw().step(),
+    )
   }
 
   #[test]
@@ -463,17 +545,8 @@ mod tests {
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
     let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
     let n_count = count_len(num_chunks);
-    let count = vec![1_u8; n_count];
-    let r = RangeEmbeddings::new(
-      48_000,
-      num_chunks,
-      seg,
-      emb,
-      count,
-      chunks_sw(),
-      frames_sw(),
-    )
-    .expect("consistent shapes");
+    let r = RangeEmbeddings::new(48_000, num_chunks, seg, emb, chunks_sw(), frames_sw())
+      .expect("consistent shapes");
     assert_eq!(r.abs_start_sample(), 48_000);
     assert_eq!(r.num_chunks(), 2);
     assert_eq!(
@@ -484,7 +557,13 @@ mod tests {
       r.raw_embeddings().len(),
       2 * SLOTS_PER_CHUNK * EMBEDDING_DIM
     );
+    // The DERIVED count has the exact pyannote output-frame length, and
+    // for all-zero (silent) segmentations every cell is 0.
     assert_eq!(r.count().len(), n_count);
+    assert!(
+      r.count().iter().all(|&c| c == 0),
+      "silent segmentations must derive an all-zero count"
+    );
   }
 
   #[test]
@@ -492,13 +571,11 @@ mod tests {
     let num_chunks = 1;
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
     let emb_bad = vec![0.0_f32; 999];
-    let count = vec![1_u8; count_len(num_chunks)];
     let r = RangeEmbeddings::new(
       0,
       num_chunks,
       seg.clone(),
       emb_bad,
-      count.clone(),
       chunks_sw(),
       frames_sw(),
     );
@@ -507,83 +584,72 @@ mod tests {
       Err(RangeShapeError::RawEmbeddingsLenMismatch { .. })
     ));
 
-    let r = RangeEmbeddings::new(
-      0,
-      0,
-      Vec::new(),
-      Vec::new(),
-      count,
-      chunks_sw(),
-      frames_sw(),
-    );
+    let r = RangeEmbeddings::new(0, 0, Vec::new(), Vec::new(), chunks_sw(), frames_sw());
     assert!(matches!(r, Err(RangeShapeError::ZeroChunks)));
   }
 
-  /// FINDING 1: a `count` longer than the exact pyannote output-frame
-  /// count is rejected at construction — previously only an EMPTY
-  /// count was caught, so a too-long count (with positive trailing
-  /// values) reached `cluster_ranges_inner` and made reconstruct
-  /// fabricate/extend spans.
+  /// R3 (the structural fix): a public caller passing all-zero
+  /// segmentations can NOT fabricate speaker spans by supplying a
+  /// crafted count, because `new` no longer accepts a count — it DERIVES
+  /// the count from the segmentations. The carrier built from silent
+  /// segmentations carries an all-zero count of the exact output-frame
+  /// length, and clustering that range yields ZERO spans (no fabricated
+  /// speech from silence).
+  ///
+  /// Before the fix, `new` took a `count: Vec<u8>` argument and only
+  /// validated its length, so `new(.., all_zero_seg, .., all_one_count
+  /// of exact length, ..)` constructed a carrier whose `count[t] == 1`
+  /// for every frame; `cluster_ranges_inner` -> reconstruct then read
+  /// `count[t]` as the top-k speaker count and emitted spans even though
+  /// every reconstructed activation row was all-zero — speech conjured
+  /// from silence. With the derive design that input is unconstructable:
+  /// the all-one count cannot be passed at all, and the derived count is
+  /// all-zero.
   #[test]
-  fn new_rejects_too_long_count() {
+  fn new_derives_count_from_segmentations_no_fabrication_from_silence() {
+    let plda = crate::plda::PldaTransform::new().expect("plda");
+    let opts = crate::streaming::StreamingOfflineOptions::new();
     let num_chunks = 2;
+    // All-zero (silent) segmentations.
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
     let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
-    let expected = count_len(num_chunks);
-    let count = vec![1_u8; expected + 1];
-    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw(), frames_sw());
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw(), frames_sw())
+      .expect("silent range constructs");
+    // The DERIVED count is all-zero (no active speakers in any frame),
+    // at the exact output-frame length — NOT a caller-controlled all-one.
+    assert_eq!(r.count().len(), count_len(num_chunks));
     assert!(
-      matches!(
-        r,
-        Err(RangeShapeError::CountLenMismatch { expected: e, got })
-          if e == expected && got == expected + 1
-      ),
-      "got {r:?}"
+      r.count().iter().all(|&c| c == 0),
+      "derived count for silent segmentations must be all-zero, got {:?}",
+      &r.count()[..r.count().len().min(8)]
     );
-  }
-
-  /// FINDING 1: a `count` shorter than the exact output-frame count is
-  /// also rejected at the public boundary (it would otherwise truncate
-  /// trailing frames, caught only later — or not at all).
-  #[test]
-  fn new_rejects_too_short_count() {
-    let num_chunks = 2;
-    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
-    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
-    let expected = count_len(num_chunks);
-    let count = vec![1_u8; expected - 1];
-    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw(), frames_sw());
-    assert!(
-      matches!(
-        r,
-        Err(RangeShapeError::CountLenMismatch { expected: e, got })
-          if e == expected && got == expected - 1
-      ),
-      "got {r:?}"
-    );
-  }
-
-  /// FINDING 1: an empty count is still rejected (now via the exact
-  /// mismatch path, since the exact count is always >= 1 for a valid
-  /// range).
-  #[test]
-  fn new_rejects_empty_count() {
-    let num_chunks = 1;
-    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
-    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
-    let r = RangeEmbeddings::new(
+    // End to end: clustering a silent range fabricates NO spans.
+    let spans =
+      crate::streaming::cluster_ranges(std::slice::from_ref(&r), &plda, &opts).expect("cluster ok");
+    assert_eq!(
+      spans.len(),
       0,
-      num_chunks,
-      seg,
-      emb,
-      Vec::new(),
-      chunks_sw(),
-      frames_sw(),
+      "silent segmentations must not fabricate any speaker spans"
     );
-    assert!(
-      matches!(r, Err(RangeShapeError::CountLenMismatch { got: 0, .. })),
-      "got {r:?}"
-    );
+  }
+
+  /// The derive boundary rejects non-finite segmentation cells (NaN /
+  /// ±inf) rather than threshold-comparing them into a misleading count.
+  /// `try_count_pyannote`'s segmentation finite-check surfaces here as a
+  /// typed `NonFiniteSegmentations`.
+  #[test]
+  fn new_rejects_non_finite_segmentations() {
+    let num_chunks = 1;
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+      let mut seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+      seg[0] = bad;
+      let r = RangeEmbeddings::new(0, num_chunks, seg, emb.clone(), chunks_sw(), frames_sw());
+      assert!(
+        matches!(r, Err(RangeShapeError::NonFiniteSegmentations)),
+        "got {r:?} for segmentation cell {bad}"
+      );
+    }
   }
 
   /// FINDING 3: a `num_chunks` large enough to overflow the
@@ -594,15 +660,7 @@ mod tests {
   #[test]
   fn new_rejects_shape_overflow() {
     let huge = usize::MAX / 2;
-    let r = RangeEmbeddings::new(
-      0,
-      huge,
-      Vec::new(),
-      Vec::new(),
-      Vec::new(),
-      chunks_sw(),
-      frames_sw(),
-    );
+    let r = RangeEmbeddings::new(0, huge, Vec::new(), Vec::new(), chunks_sw(), frames_sw());
     assert!(
       matches!(r, Err(RangeShapeError::ShapeOverflow { num_chunks, .. }) if num_chunks == huge),
       "got {r:?}"
@@ -623,10 +681,9 @@ mod tests {
     // Otherwise-valid chunk window, but start = 1.0 (one second late).
     let chunk_dur = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
     let bad_chunks = SlidingWindow::new(1.0, chunk_dur, 1.0);
-    // Length still matches what the count helper derives (it ignores
-    // start), so the count-length check would NOT catch this.
-    let count = vec![1_u8; count_len(num_chunks)];
-    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, bad_chunks, frames_sw());
+    // `validate_geometry` runs before the count is derived, so the
+    // non-zero start is caught up front regardless of the segmentations.
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, bad_chunks, frames_sw());
     assert!(
       matches!(
         r,
@@ -646,8 +703,7 @@ mod tests {
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
     let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
     let bad_frames = SlidingWindow::new(0.5, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
-    let count = vec![1_u8; count_len(num_chunks)];
-    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw(), bad_frames);
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw(), bad_frames);
     assert!(
       matches!(
         r,
@@ -668,7 +724,6 @@ mod tests {
     let num_chunks = 1;
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
     let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
-    let count = vec![1_u8; count_len(num_chunks)];
     // duration = 0.0 (zero), step valid.
     let zero_dur = SlidingWindow::new(0.0, 0.0, PYANNOTE_FRAME_STEP_S);
     let r = RangeEmbeddings::new(
@@ -676,7 +731,6 @@ mod tests {
       num_chunks,
       seg.clone(),
       emb.clone(),
-      count.clone(),
       chunks_sw(),
       zero_dur,
     );
@@ -693,7 +747,7 @@ mod tests {
     );
     // duration = -1.0 (negative).
     let neg_dur = SlidingWindow::new(0.0, -1.0, PYANNOTE_FRAME_STEP_S);
-    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw(), neg_dur);
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw(), neg_dur);
     assert!(
       matches!(
         r,
@@ -708,15 +762,14 @@ mod tests {
   }
 
   /// FINDING 1: a zero / negative `chunks_sw.step` is rejected as a
-  /// non-positive window parameter. `try_num_output_frames_pyannote`
-  /// only guards `frame_step`, so a zero chunk step would otherwise reach
-  /// `try_count_pyannote` / reconstruct and fail only after clustering.
+  /// non-positive window parameter by `validate_geometry`, up front —
+  /// before the count is derived — so a zero chunk step can never reach
+  /// reconstruct and fail only after clustering.
   #[test]
   fn new_rejects_non_positive_chunk_step() {
     let num_chunks = 1;
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
     let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
-    let count = vec![1_u8; count_len(num_chunks)];
     let chunk_dur = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
     // step = 0.0 (zero).
     let zero_step = SlidingWindow::new(0.0, chunk_dur, 0.0);
@@ -725,7 +778,6 @@ mod tests {
       num_chunks,
       seg.clone(),
       emb.clone(),
-      count.clone(),
       zero_step,
       frames_sw(),
     );
@@ -742,7 +794,7 @@ mod tests {
     );
     // step = -1.0 (negative).
     let neg_step = SlidingWindow::new(0.0, chunk_dur, -1.0);
-    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, neg_step, frames_sw());
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, neg_step, frames_sw());
     assert!(
       matches!(
         r,
@@ -765,7 +817,6 @@ mod tests {
     let num_chunks = 1;
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
     let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
-    let count = vec![1_u8; count_len(num_chunks)];
     // NaN chunk duration.
     let nan_dur = SlidingWindow::new(0.0, f64::NAN, 1.0);
     let r = RangeEmbeddings::new(
@@ -773,7 +824,6 @@ mod tests {
       num_chunks,
       seg.clone(),
       emb.clone(),
-      count.clone(),
       nan_dur,
       frames_sw(),
     );
@@ -790,7 +840,7 @@ mod tests {
     );
     // +inf frame step.
     let inf_step = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, f64::INFINITY);
-    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw(), inf_step);
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw(), inf_step);
     assert!(
       matches!(
         r,
@@ -808,7 +858,7 @@ mod tests {
   /// derived output-frame count overflows the cap is rejected as
   /// `InvalidGeometry` (the residual case after the explicit-invariant
   /// checks). Enormous `chunk_duration` + tiny `frame_step` saturates the
-  /// `try_num_output_frames_pyannote` cap.
+  /// pyannote output-frame-count cap inside the `derive_count` pass.
   #[test]
   fn new_rejects_uncomputable_count_geometry() {
     let num_chunks = 1;
@@ -817,8 +867,7 @@ mod tests {
     // All positive + finite + start 0, but the count saturates the cap.
     let huge_chunks = SlidingWindow::new(0.0, 1.0e15, 1.0);
     let tiny_frames = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, 1.0e-15);
-    let count = vec![1_u8; 8];
-    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, huge_chunks, tiny_frames);
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, huge_chunks, tiny_frames);
     assert!(
       matches!(r, Err(RangeShapeError::InvalidGeometry)),
       "got {r:?}"
