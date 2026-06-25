@@ -63,6 +63,7 @@ use crate::{
     SAMPLE_RATE_HZ, SegmentModel, WINDOW_SAMPLES,
     powerset::{powerset_to_speakers_hard, softmax_row},
   },
+  streaming::RangeEmbeddings,
 };
 
 /// Number of speaker slots per chunk. Same as
@@ -270,36 +271,7 @@ impl DiarizedSpan {
 /// timeline.
 pub struct StreamingOfflineDiarizer {
   options: StreamingOfflineOptions,
-  ranges: Vec<AccumulatedRange>,
-}
-
-/// Per-voice-range derived tensors plus original-timeline anchor.
-struct AccumulatedRange {
-  /// Absolute sample at which this voice range starts in the
-  /// original audio stream. Used to re-anchor output spans.
-  abs_start_sample: u64,
-  /// Number of segmentation chunks emitted within this range.
-  num_chunks: usize,
-  /// Per-(chunk, frame, slot) segmentation activity, flattened
-  /// `[c][f][s]`. Length `num_chunks * FRAMES_PER_WINDOW *
-  /// SLOTS_PER_CHUNK`. f64 to match pyannote internals. Spill-backed
-  /// so very long voice ranges (multi-hour single utterance) don't
-  /// OOM the heap; small ranges stay heap-resident.
-  segmentations: crate::ops::spill::SpillBytesMut<f64>,
-  /// Per-(chunk, slot) raw f32 embeddings, flattened `[c][s][d]`.
-  /// Length `num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`.
-  /// Spill-backed for the same reason as `segmentations`.
-  raw_embeddings: crate::ops::spill::SpillBytesMut<f32>,
-  /// Per-output-frame instantaneous speaker count, computed by
-  /// `aggregate::count_pyannote` on this range's segmentations.
-  /// `Arc<[u8]>` to avoid a copy from `count_pyannote`'s output;
-  /// also lets `finalize` cheaply hand the per-range buffer to
-  /// downstream stages.
-  count: Arc<[u8]>,
-  /// Output-frame sliding window (local to this range, start = 0).
-  frames_sw_local: SlidingWindow,
-  /// Chunk-level sliding window (local to this range, start = 0).
-  chunks_sw_local: SlidingWindow,
+  ranges: Vec<RangeEmbeddings>,
 }
 
 impl StreamingOfflineDiarizer {
@@ -564,15 +536,15 @@ impl StreamingOfflineDiarizer {
     )?
     .into_parts();
 
-    self.ranges.push(AccumulatedRange {
+    self.ranges.push(RangeEmbeddings::from_validated(
       abs_start_sample,
       num_chunks,
-      segmentations,
-      raw_embeddings,
-      count,
-      frames_sw_local,
+      segmentations.as_slice().to_vec(),
+      raw_embeddings.as_slice().to_vec(),
+      count.to_vec(),
       chunks_sw_local,
-    });
+      frames_sw_local,
+    ));
 
     Ok(())
   }
@@ -601,179 +573,7 @@ impl StreamingOfflineDiarizer {
   /// - All other errors propagate from `diarize_offline` /
   ///   `reconstruct`.
   pub fn finalize(&self, plda: &PldaTransform) -> Result<Arc<[DiarizedSpan]>, StreamingError> {
-    if self.ranges.is_empty() {
-      return Ok(Arc::from([] as [DiarizedSpan; 0]));
-    }
-    let total_chunks: usize = self.ranges.iter().map(|r| r.num_chunks).sum();
-    if total_chunks == 0 {
-      return Err(StreamingShapeError::AllRangesEmpty.into());
-    }
-
-    // ── 1. Concatenate per-range tensors ───────────────────────────
-    //
-    // The concatenated tensors are the dominant memory footprint at
-    // multi-hour scale: `all_segs` ≈ 50 MB / hour, plus
-    // `all_emb` ≈ 11 MB / hour. Both cross the 64 MiB default
-    // threshold past ~5 h of accumulated voice. Spill-back so we
-    // don't OOM the heap.
-    let total_segs_len = total_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
-    let total_emb_len = total_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
-    let mut all_segs = crate::ops::spill::SpillBytesMut::<f64>::zeros(
-      total_segs_len,
-      self.options.diarization.spill_options(),
-    )?;
-    let mut all_emb = crate::ops::spill::SpillBytesMut::<f32>::zeros(
-      total_emb_len,
-      self.options.diarization.spill_options(),
-    )?;
-    {
-      let segs = all_segs.as_mut_slice();
-      let embs = all_emb.as_mut_slice();
-      let mut s_off = 0;
-      let mut e_off = 0;
-      for r in &self.ranges {
-        let s_n = r.segmentations.len();
-        segs[s_off..s_off + s_n].copy_from_slice(r.segmentations.as_slice());
-        s_off += s_n;
-        let e_n = r.raw_embeddings.len();
-        embs[e_off..e_off + e_n].copy_from_slice(r.raw_embeddings.as_slice());
-        e_off += e_n;
-      }
-    }
-
-    // ── 2. Concatenate count tensors (per-range adjacent in output) ─
-    let total_output_frames: usize = self.ranges.iter().map(|r| r.count.len()).sum();
-    let mut all_count = crate::ops::spill::SpillBytesMut::<u8>::zeros(
-      total_output_frames,
-      self.options.diarization.spill_options(),
-    )?;
-    {
-      let buf = all_count.as_mut_slice();
-      let mut off = 0;
-      for r in &self.ranges {
-        let n = r.count.len();
-        buf[off..off + n].copy_from_slice(&r.count);
-        off += n;
-      }
-    }
-
-    // ── 3. Run global cluster_vbx via diarize_offline ──────────────
-    //
-    // `diarize_offline`'s reconstruct stage uses `chunks_sw` /
-    // `frames_sw` to map per-chunk frames onto the global output
-    // grid. With our concatenated chunks (which have non-uniform
-    // gaps in absolute time), this global reconstruct would emit
-    // garbage timings. So we ignore its reconstruct output and
-    // re-reconstruct per range below.
-    let cfg = &self.options.diarization;
-    let chunks_sw_global = self.ranges[0].chunks_sw_local;
-    let frames_sw_global = self.ranges[0].frames_sw_local;
-    let input = OfflineInput::new(
-      all_emb.as_slice(),
-      total_chunks,
-      SLOTS_PER_CHUNK,
-      all_segs.as_slice(),
-      FRAMES_PER_WINDOW,
-      all_count.as_slice(),
-      total_output_frames,
-      chunks_sw_global,
-      frames_sw_global,
-      plda,
-    )
-    .with_threshold(cfg.threshold())
-    .with_fa(cfg.fa())
-    .with_fb(cfg.fb())
-    .with_max_iters(cfg.max_iters())
-    .with_min_duration_off(cfg.min_duration_off())
-    .with_smoothing_epsilon(cfg.smoothing_epsilon())
-    .with_spill_options(self.options.diarization.spill_options().clone());
-    let offline_out = diarize_offline(&input)?;
-    let hard_clusters = offline_out.hard_clusters();
-    let num_clusters = offline_out.num_clusters();
-    debug_assert_eq!(hard_clusters.len(), total_chunks);
-
-    // ── 4. Per-range reconstruct → spans → original timeline ───────
-    //
-    // `reconstruct` sizes its output grid as `(num_output_frames,
-    // num_clusters_local)` where `num_clusters_local =
-    // max(max(hard_clusters_slice) + 1, max(count_slice), 1)`. We
-    // recompute it the same way so `discrete_to_spans`'s shape
-    // assertion holds. Span cluster ids are the global hard-cluster
-    // ids regardless of `num_clusters_local`, so cross-range identity
-    // is preserved automatically.
-    let _ = num_clusters; // global count not used here; per-range computed below.
-    let mut all_spans: Vec<DiarizedSpan> = Vec::new();
-    let sr = SAMPLE_RATE_HZ as f64;
-    let mut chunk_offset = 0usize;
-    for r in &self.ranges {
-      let hc_slice = &hard_clusters[chunk_offset..chunk_offset + r.num_chunks];
-      chunk_offset += r.num_chunks;
-
-      let recon_input = ReconstructInput::new(
-        r.segmentations.as_slice(),
-        r.num_chunks,
-        FRAMES_PER_WINDOW,
-        SLOTS_PER_CHUNK,
-        hc_slice,
-        &r.count,
-        r.count.len(),
-        r.chunks_sw_local,
-        r.frames_sw_local,
-      )
-      .with_smoothing_epsilon(cfg.smoothing_epsilon())
-      .with_spill_options(self.options.diarization.spill_options().clone());
-      let discrete = reconstruct_grid(&recon_input)?;
-
-      let max_cluster_local = hc_slice
-        .iter()
-        .flat_map(|row| row.iter())
-        .copied()
-        .max()
-        .unwrap_or(-1);
-      let max_count_local = r.count.iter().copied().max().unwrap_or(0) as usize;
-      let num_clusters_local = if max_cluster_local < 0 {
-        // No assigned clusters → reconstruct returns a 1D
-        // `num_output_frames`-length zero vector (see
-        // `reconstruct::algo::reconstruct` early-out at
-        // `max_cluster < 0`). `discrete_to_spans` would then assert
-        // on `grid.len() == num_output_frames * num_clusters`, so
-        // skip the call entirely.
-        debug_assert_eq!(discrete.len(), r.count.len());
-        continue;
-      } else {
-        ((max_cluster_local + 1) as usize).max(max_count_local.max(1))
-      };
-
-      let local_spans: Vec<RttmSpan> = discrete_to_spans(
-        discrete.as_slice(),
-        r.count.len(),
-        num_clusters_local,
-        r.frames_sw_local,
-        cfg.min_duration_off(),
-      );
-
-      for span in local_spans {
-        let start_off_samples = (span.start() * sr).max(0.0) as u64;
-        let dur_samples = (span.duration() * sr).max(0.0) as u64;
-        all_spans.push(DiarizedSpan {
-          start_sample: r.abs_start_sample.saturating_add(start_off_samples),
-          end_sample: r
-            .abs_start_sample
-            .saturating_add(start_off_samples)
-            .saturating_add(dur_samples),
-          speaker_id: span.cluster() as u32,
-        });
-      }
-    }
-
-    // Sort by start time so callers can stream the output in order.
-    all_spans.sort_by_key(|s| s.start_sample);
-    // One-time `Vec`→`Arc<[T]>` copy at the boundary. `all_spans` is
-    // built by `Vec::push` because span count is unknown a-priori
-    // (it depends on per-range `discrete_to_spans` output); converting
-    // to `Arc<[DiarizedSpan]>` lets downstream consumers fan out
-    // cheaply via `Arc::clone`.
-    Ok(Arc::from(all_spans))
+    cluster_ranges_inner(&self.ranges, &self.options, plda)
   }
 
   /// Drop accumulated tensors. Useful for reusing the same diarizer
@@ -781,6 +581,218 @@ impl StreamingOfflineDiarizer {
   /// since IDs are decided at `finalize`-time, not held as state.
   pub fn reset(&mut self) {
     self.ranges.clear();
+  }
+}
+
+/// Shared cluster-and-reconstruct core used by both
+/// [`StreamingOfflineDiarizer::finalize`] and the public
+/// [`crate::streaming::cluster_ranges`] entry point. Concatenates all
+/// ranges' tensors, runs the single global `diarize_offline` pass, then
+/// re-reconstructs per range on its local timing and re-anchors spans to
+/// the original stream. Deterministic — `diarize_offline` has no RNG, so
+/// identical inputs produce identical spans.
+pub(crate) fn cluster_ranges_inner(
+  ranges: &[RangeEmbeddings],
+  options: &StreamingOfflineOptions,
+  plda: &PldaTransform,
+) -> Result<Arc<[DiarizedSpan]>, StreamingError> {
+  if ranges.is_empty() {
+    return Ok(Arc::from([] as [DiarizedSpan; 0]));
+  }
+  let total_chunks: usize = ranges.iter().map(|r| r.num_chunks()).sum();
+  if total_chunks == 0 {
+    return Err(StreamingShapeError::AllRangesEmpty.into());
+  }
+  let spill = options.diarization().spill_options();
+
+  // ── 1. Concatenate per-range tensors ───────────────────────────
+  //
+  // The concatenated tensors are the dominant memory footprint at
+  // multi-hour scale: `all_segs` ≈ 50 MB / hour, plus
+  // `all_emb` ≈ 11 MB / hour. Both cross the 64 MiB default
+  // threshold past ~5 h of accumulated voice. Spill-back so we
+  // don't OOM the heap.
+  let total_segs_len = total_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
+  let total_emb_len = total_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
+  let mut all_segs = crate::ops::spill::SpillBytesMut::<f64>::zeros(total_segs_len, spill)?;
+  let mut all_emb = crate::ops::spill::SpillBytesMut::<f32>::zeros(total_emb_len, spill)?;
+  {
+    let segs = all_segs.as_mut_slice();
+    let embs = all_emb.as_mut_slice();
+    let mut s_off = 0;
+    let mut e_off = 0;
+    for r in ranges {
+      let s_n = r.segmentations().len();
+      segs[s_off..s_off + s_n].copy_from_slice(r.segmentations());
+      s_off += s_n;
+      let e_n = r.raw_embeddings().len();
+      embs[e_off..e_off + e_n].copy_from_slice(r.raw_embeddings());
+      e_off += e_n;
+    }
+  }
+
+  // ── 2. Concatenate count tensors (per-range adjacent in output) ─
+  let total_output_frames: usize = ranges.iter().map(|r| r.count().len()).sum();
+  let mut all_count = crate::ops::spill::SpillBytesMut::<u8>::zeros(total_output_frames, spill)?;
+  {
+    let buf = all_count.as_mut_slice();
+    let mut off = 0;
+    for r in ranges {
+      let n = r.count().len();
+      buf[off..off + n].copy_from_slice(r.count());
+      off += n;
+    }
+  }
+
+  // ── 3. Run global cluster_vbx via diarize_offline ──────────────
+  //
+  // `diarize_offline`'s reconstruct stage uses `chunks_sw` /
+  // `frames_sw` to map per-chunk frames onto the global output
+  // grid. With our concatenated chunks (which have non-uniform
+  // gaps in absolute time), this global reconstruct would emit
+  // garbage timings. So we ignore its reconstruct output and
+  // re-reconstruct per range below.
+  let cfg = options.diarization();
+  let chunks_sw_global = ranges[0].chunks_sw();
+  let frames_sw_global = ranges[0].frames_sw();
+  let input = OfflineInput::new(
+    all_emb.as_slice(),
+    total_chunks,
+    SLOTS_PER_CHUNK,
+    all_segs.as_slice(),
+    FRAMES_PER_WINDOW,
+    all_count.as_slice(),
+    total_output_frames,
+    chunks_sw_global,
+    frames_sw_global,
+    plda,
+  )
+  .with_threshold(cfg.threshold())
+  .with_fa(cfg.fa())
+  .with_fb(cfg.fb())
+  .with_max_iters(cfg.max_iters())
+  .with_min_duration_off(cfg.min_duration_off())
+  .with_smoothing_epsilon(cfg.smoothing_epsilon())
+  .with_spill_options(spill.clone());
+  let offline_out = diarize_offline(&input)?;
+  let hard_clusters = offline_out.hard_clusters();
+  debug_assert_eq!(hard_clusters.len(), total_chunks);
+
+  // ── 4. Per-range reconstruct → spans → original timeline ───────
+  //
+  // `reconstruct` sizes its output grid as `(num_output_frames,
+  // num_clusters_local)` where `num_clusters_local =
+  // max(max(hard_clusters_slice) + 1, max(count_slice), 1)`. We
+  // recompute it the same way so `discrete_to_spans`'s shape
+  // assertion holds. Span cluster ids are the global hard-cluster
+  // ids regardless of `num_clusters_local`, so cross-range identity
+  // is preserved automatically.
+  let mut all_spans: Vec<DiarizedSpan> = Vec::new();
+  let sr = SAMPLE_RATE_HZ as f64;
+  let mut chunk_offset = 0usize;
+  for r in ranges {
+    let hc_slice = &hard_clusters[chunk_offset..chunk_offset + r.num_chunks()];
+    chunk_offset += r.num_chunks();
+
+    let recon_input = ReconstructInput::new(
+      r.segmentations(),
+      r.num_chunks(),
+      FRAMES_PER_WINDOW,
+      SLOTS_PER_CHUNK,
+      hc_slice,
+      r.count(),
+      r.count().len(),
+      r.chunks_sw(),
+      r.frames_sw(),
+    )
+    .with_smoothing_epsilon(cfg.smoothing_epsilon())
+    .with_spill_options(spill.clone());
+    let discrete = reconstruct_grid(&recon_input)?;
+
+    let max_cluster_local = hc_slice
+      .iter()
+      .flat_map(|row| row.iter())
+      .copied()
+      .max()
+      .unwrap_or(-1);
+    let max_count_local = r.count().iter().copied().max().unwrap_or(0) as usize;
+    let num_clusters_local = if max_cluster_local < 0 {
+      // No assigned clusters → reconstruct returns a 1D
+      // `num_output_frames`-length zero vector (see
+      // `reconstruct::algo::reconstruct` early-out at
+      // `max_cluster < 0`). `discrete_to_spans` would then assert
+      // on `grid.len() == num_output_frames * num_clusters`, so
+      // skip the call entirely.
+      debug_assert_eq!(discrete.len(), r.count().len());
+      continue;
+    } else {
+      ((max_cluster_local + 1) as usize).max(max_count_local.max(1))
+    };
+
+    let local_spans: Vec<RttmSpan> = discrete_to_spans(
+      discrete.as_slice(),
+      r.count().len(),
+      num_clusters_local,
+      r.frames_sw(),
+      cfg.min_duration_off(),
+    );
+
+    for span in local_spans {
+      let start_off_samples = (span.start() * sr).max(0.0) as u64;
+      let dur_samples = (span.duration() * sr).max(0.0) as u64;
+      all_spans.push(DiarizedSpan::new(
+        r.abs_start_sample().saturating_add(start_off_samples),
+        r.abs_start_sample()
+          .saturating_add(start_off_samples)
+          .saturating_add(dur_samples),
+        span.cluster() as u32,
+      ));
+    }
+  }
+
+  // Sort by start time so callers can stream the output in order.
+  all_spans.sort_by_key(|s| s.start_sample());
+  // One-time `Vec`→`Arc<[T]>` copy at the boundary. `all_spans` is
+  // built by `Vec::push` because span count is unknown a-priori
+  // (it depends on per-range `discrete_to_spans` output); converting
+  // to `Arc<[DiarizedSpan]>` lets downstream consumers fan out
+  // cheaply via `Arc::clone`.
+  Ok(Arc::from(all_spans))
+}
+
+#[cfg(test)]
+mod refactor_tests {
+  use super::*;
+  use crate::{reconstruct::SlidingWindow, segment::FRAMES_PER_WINDOW};
+
+  const SLOTS: usize = 3;
+
+  /// `cluster_ranges_inner` on a single all-silent range returns Ok
+  /// with no spans (the `num_train < 2` pyannote fast path yields
+  /// hard_clusters all-zero, and an all-zero range reconstructs to no
+  /// emitted speakers). Proves the extracted helper is callable and the
+  /// carrier→OfflineInput wiring holds.
+  #[test]
+  fn cluster_ranges_inner_empty_range_is_ok_empty() {
+    let plda = PldaTransform::new().expect("plda");
+    let opts = StreamingOfflineOptions::new();
+    let num_chunks = 1;
+    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS];
+    let emb = vec![0.0_f32; num_chunks * SLOTS * EMBEDDING_DIM];
+    // One chunk's worth of output frames, all count 0 (no active
+    // speakers). `diarize_offline`'s reconstruct stage requires
+    // `num_output_frames >= FRAMES_PER_WINDOW` for a single chunk, so a
+    // 1-frame count is rejected before the clustering fast path; size
+    // it to the chunk's frame count to exercise the all-silent path.
+    let count = vec![0_u8; FRAMES_PER_WINDOW];
+    let chunk_dur = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
+    let chunks_sw = SlidingWindow::new(0.0, chunk_dur, 1.0);
+    let frames_sw = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
+    let range =
+      crate::streaming::RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw, frames_sw)
+        .expect("carrier");
+    let spans = cluster_ranges_inner(&[range], &opts, &plda).expect("cluster ok");
+    assert_eq!(spans.len(), 0, "all-silent range yields no spans");
   }
 }
 

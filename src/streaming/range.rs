@@ -131,6 +131,31 @@ impl RangeEmbeddings {
     })
   }
 
+  /// Construct without re-validating shapes. Used by
+  /// [`crate::streaming::StreamingOfflineDiarizer::push_voice_range`],
+  /// which builds the tensors itself and has already enforced the
+  /// length invariants by construction.
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn from_validated(
+    abs_start_sample: u64,
+    num_chunks: usize,
+    segmentations: Vec<f64>,
+    raw_embeddings: Vec<f32>,
+    count: Vec<u8>,
+    chunks_sw: SlidingWindow,
+    frames_sw: SlidingWindow,
+  ) -> Self {
+    Self {
+      abs_start_sample,
+      num_chunks,
+      segmentations,
+      raw_embeddings,
+      count,
+      chunks_sw,
+      frames_sw,
+    }
+  }
+
   /// Absolute sample index where this range starts in the original stream.
   pub const fn abs_start_sample(&self) -> u64 {
     self.abs_start_sample
