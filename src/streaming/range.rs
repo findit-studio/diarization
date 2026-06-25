@@ -56,17 +56,62 @@ pub enum RangeShapeError {
     /// Actual length.
     got: usize,
   },
-  /// The supplied `chunks_sw` / `frames_sw` do not yield a valid
-  /// pyannote output-frame geometry (zero/non-finite duration or step,
-  /// or an output-frame count that overflows / exceeds the cap). The
-  /// expected `count` length is derived from this geometry via the
-  /// same `aggregate::try_num_output_frames_pyannote` helper the
-  /// count-tensor stage uses, so an invalid window makes the length
-  /// uncheckable; reject it here rather than letting the carrier
-  /// through with an unvalidatable `count`.
+  /// A `SlidingWindow` start offset is not the local origin (`0.0`)
+  /// the split protocol requires. `build_range` always emits both
+  /// `chunks_sw` and `frames_sw` with `start == 0.0`, and the count
+  /// derivation ([`aggregate::try_num_output_frames_pyannote`]) plus
+  /// reconstruct's overlap-add (`chunk_start_time = chunks_sw.start +
+  /// c * chunks_sw.step`, `closest_frame` subtracts `frames_sw.start`)
+  /// both bake in that origin. A non-zero start is NOT reflected in the
+  /// count length (the helper takes only `duration`/`step`), yet
+  /// reconstruct honours it — so reconstruction emits every span offset
+  /// by `start * SR` BEFORE `abs_start_sample` is added, silently
+  /// shifting the whole range off its true timeline. Reject it at the
+  /// boundary instead of letting a malformed or version-skewed payload
+  /// reach clustering.
   #[error(
-    "invalid chunks_sw/frames_sw geometry: cannot derive the pyannote output-frame count \
-     (zero/non-finite duration or step, or output-frame count overflow)"
+    "{which}.start ({got}) must be 0.0 (the split-protocol local origin); \
+     a non-zero start shifts reconstructed spans off the timeline"
+  )]
+  NonZeroWindowStart {
+    /// Which window violated the origin (`"chunks_sw"` /
+    /// `"frames_sw"`).
+    which: &'static str,
+    /// The offending `start` value.
+    got: f64,
+  },
+  /// A `SlidingWindow` duration or step is not a finite, strictly
+  /// positive scalar. `build_range` derives each from the fixed
+  /// community-1 geometry (`WINDOW_SAMPLES / SR`, `step_samples / SR`,
+  /// and the pyannote frame constants), all `> 0`. A zero / negative /
+  /// non-finite (NaN / ±inf) value would make the pyannote output-frame
+  /// count underivable or non-finite (`try_count_pyannote` and
+  /// `reconstruct` both reject the same conditions, but only AFTER
+  /// clustering has run); reject it here so the `count` length is always
+  /// derivable and reconstruct always aligns.
+  #[error("{which}.{field} ({got}) must be a finite, strictly positive scalar")]
+  NonPositiveWindowParameter {
+    /// Which window (`"chunks_sw"` / `"frames_sw"`).
+    which: &'static str,
+    /// Which scalar (`"duration"` / `"step"`).
+    field: &'static str,
+    /// The offending value.
+    got: f64,
+  },
+  /// The supplied `chunks_sw` / `frames_sw` pass the start/duration/step
+  /// invariants but still do not yield a derivable pyannote
+  /// output-frame count — the count overflows `usize` or exceeds the
+  /// [`MAX_OUTPUT_FRAMES`](crate::aggregate::MAX_OUTPUT_FRAMES) cap (an
+  /// extreme `chunk_duration / frame_step` whose product saturates the
+  /// frame-count computation). The expected `count` length is derived
+  /// from this geometry via the same
+  /// `aggregate::try_num_output_frames_pyannote` helper the count-tensor
+  /// stage uses, so an underivable count makes the length uncheckable;
+  /// reject it here rather than letting the carrier through with an
+  /// unvalidatable `count`.
+  #[error(
+    "chunks_sw/frames_sw geometry: cannot derive the pyannote output-frame count \
+     (count overflows usize or exceeds MAX_OUTPUT_FRAMES)"
   )]
   InvalidGeometry,
   /// `count.len()` does not equal the exact pyannote output-frame
@@ -89,6 +134,61 @@ pub enum RangeShapeError {
   },
 }
 
+/// Validate the COMPLETE `SlidingWindow` geometry contract the split
+/// protocol requires, BEFORE deriving the expected `count` length.
+///
+/// The count derivation ([`try_num_output_frames_pyannote`]) only
+/// inspects `chunks_sw.duration`, `chunks_sw.step`, and
+/// `frames_sw.step` — it drops both `start` offsets and never sees
+/// `frames_sw.duration`. But reconstruct (`cluster_ranges_inner` ->
+/// `reconstruct`) consumes ALL six scalars: its overlap-add computes
+/// `chunk_start_time = chunks_sw.start + c * chunks_sw.step` and
+/// `closest_frame(t) = round((t - frames_sw.start - frames_sw.duration
+/// / 2) / frames_sw.step)`. So a window that satisfies the count helper
+/// can still be geometrically inconsistent with the count it produced —
+/// e.g. a non-zero `chunks_sw.start` leaves the count length unchanged
+/// yet shifts every reconstructed span. Enforce the full contract here.
+///
+/// Invariants enforced (exactly what `build_range` guarantees and what
+/// reconstruct / `try_count_pyannote` assume):
+/// 1. `chunks_sw.start == 0.0` and `frames_sw.start == 0.0` — the
+///    split-protocol local origin. The pyannote count formula and
+///    reconstruct both bake this in; a non-zero start desynchronizes
+///    them and offsets spans off the timeline.
+/// 2. `chunks_sw.duration`, `chunks_sw.step`, `frames_sw.duration`,
+///    `frames_sw.step` are each finite and strictly positive. Zero /
+///    negative / NaN / ±inf make the output-frame count underivable or
+///    non-finite (and reconstruct rejects them too, but only after
+///    clustering has run).
+///
+/// `frames_sw.duration` is checked here even though the count helper
+/// ignores it, because reconstruct's `center_offset = 0.5 *
+/// frames_sw.duration` does use it: a non-finite frame duration would
+/// drive `closest_frame` to a non-finite index downstream.
+fn validate_geometry(
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Result<(), RangeShapeError> {
+  for (which, w) in [("chunks_sw", chunks_sw), ("frames_sw", frames_sw)] {
+    if w.start() != 0.0 {
+      return Err(RangeShapeError::NonZeroWindowStart {
+        which,
+        got: w.start(),
+      });
+    }
+    for (field, v) in [("duration", w.duration()), ("step", w.step())] {
+      if !v.is_finite() || v <= 0.0 {
+        return Err(RangeShapeError::NonPositiveWindowParameter {
+          which,
+          field,
+          got: v,
+        });
+      }
+    }
+  }
+  Ok(())
+}
+
 /// Compute the exact pyannote `num_output_frames` for one range from
 /// the same geometry the count-tensor aggregation uses, so the
 /// `count` length can be validated at the carrier boundary against the
@@ -101,6 +201,12 @@ pub enum RangeShapeError {
 /// reimplementing the `round(last_chunk_end / frame_step) + 1`
 /// geometry) keeps the carrier's accepted `count` length in lockstep
 /// with what `build_range` produces and what reconstruct consumes.
+///
+/// [`validate_geometry`] must run first: it guarantees the
+/// start/duration/step invariants this helper's caller relies on, so
+/// here a remaining error means only an overflow / above-cap
+/// output-frame count (the `chunk_duration / frame_step` saturation
+/// case), surfaced as [`RangeShapeError::InvalidGeometry`].
 fn expected_count_len(
   num_chunks: usize,
   chunks_sw: SlidingWindow,
@@ -182,9 +288,14 @@ impl RangeEmbeddings {
   ///
   /// # Errors
   /// [`RangeShapeError`] when `num_chunks == 0`, an expected length
-  /// overflows `usize`, either flattened length mismatches, the
-  /// sliding-window geometry is invalid, or `count.len()` does not
-  /// equal the derived output-frame count.
+  /// overflows `usize`, either flattened length mismatches, a
+  /// sliding-window `start` is non-zero
+  /// ([`NonZeroWindowStart`](RangeShapeError::NonZeroWindowStart)), a
+  /// window duration or step is non-finite / non-positive
+  /// ([`NonPositiveWindowParameter`](RangeShapeError::NonPositiveWindowParameter)),
+  /// the derived output-frame count overflows or exceeds the cap
+  /// ([`InvalidGeometry`](RangeShapeError::InvalidGeometry)), or
+  /// `count.len()` does not equal the derived output-frame count.
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     abs_start_sample: u64,
@@ -229,6 +340,14 @@ impl RangeEmbeddings {
         got: raw_embeddings.len(),
       });
     }
+    // Validate the COMPLETE SlidingWindow geometry contract BEFORE
+    // deriving the count length. The count helper only inspects
+    // duration/step (not the `start` offsets, not `frames_sw.duration`),
+    // so a non-zero `start` or a non-finite `frames_sw.duration` would
+    // slip past the length check yet shift / corrupt every reconstructed
+    // span. Reject the full protocol contract here so a malformed or
+    // version-skewed payload can never reach clustering.
+    validate_geometry(chunks_sw, frames_sw)?;
     // Validate `count.len()` against the EXACT pyannote output-frame
     // count derived from the same geometry the aggregation uses.
     // Replaces the prior empty-only check: that let a too-long count
@@ -490,17 +609,216 @@ mod tests {
     );
   }
 
-  /// Invalid sliding-window geometry (zero frame step) makes the
-  /// output-frame count underivable; rejected as `InvalidGeometry`
-  /// rather than panicking the geometry helper.
+  /// FINDING 1: a non-zero `chunks_sw.start` is rejected at the public
+  /// boundary. This is the core bug: the count helper drops `start`, so
+  /// the length check passes, but reconstruct honours `start` and emits
+  /// every span offset by `start * SR` BEFORE `abs_start_sample` is
+  /// added — silently shifting the range off its timeline. The full
+  /// geometry validation now catches it.
   #[test]
-  fn new_rejects_invalid_geometry() {
+  fn new_rejects_non_zero_chunk_start() {
+    let num_chunks = 2;
+    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    // Otherwise-valid chunk window, but start = 1.0 (one second late).
+    let chunk_dur = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
+    let bad_chunks = SlidingWindow::new(1.0, chunk_dur, 1.0);
+    // Length still matches what the count helper derives (it ignores
+    // start), so the count-length check would NOT catch this.
+    let count = vec![1_u8; count_len(num_chunks)];
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, bad_chunks, frames_sw());
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonZeroWindowStart { which: "chunks_sw", got })
+          if got == 1.0
+      ),
+      "got {r:?}"
+    );
+  }
+
+  /// FINDING 1: a non-zero `frames_sw.start` is rejected. `closest_frame`
+  /// subtracts `frames_sw.start`, so a non-zero value shifts every output
+  /// frame index relative to the count tensor (derived as if start == 0).
+  #[test]
+  fn new_rejects_non_zero_frame_start() {
     let num_chunks = 1;
     let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
     let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
-    let bad_frames = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, 0.0);
-    let count = vec![1_u8; 8];
+    let bad_frames = SlidingWindow::new(0.5, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
+    let count = vec![1_u8; count_len(num_chunks)];
     let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw(), bad_frames);
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonZeroWindowStart { which: "frames_sw", got })
+          if got == 0.5
+      ),
+      "got {r:?}"
+    );
+  }
+
+  /// FINDING 1: a zero / negative `frames_sw.duration` is rejected as a
+  /// non-positive window parameter. Reconstruct's `center_offset = 0.5 *
+  /// frames_sw.duration` consumes it, so a non-positive duration corrupts
+  /// frame placement; the count helper never inspects it, so only the
+  /// full geometry validation catches it.
+  #[test]
+  fn new_rejects_non_positive_frame_duration() {
+    let num_chunks = 1;
+    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    let count = vec![1_u8; count_len(num_chunks)];
+    // duration = 0.0 (zero), step valid.
+    let zero_dur = SlidingWindow::new(0.0, 0.0, PYANNOTE_FRAME_STEP_S);
+    let r = RangeEmbeddings::new(
+      0,
+      num_chunks,
+      seg.clone(),
+      emb.clone(),
+      count.clone(),
+      chunks_sw(),
+      zero_dur,
+    );
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonPositiveWindowParameter {
+          which: "frames_sw",
+          field: "duration",
+          got
+        }) if got == 0.0
+      ),
+      "got {r:?}"
+    );
+    // duration = -1.0 (negative).
+    let neg_dur = SlidingWindow::new(0.0, -1.0, PYANNOTE_FRAME_STEP_S);
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw(), neg_dur);
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonPositiveWindowParameter {
+          which: "frames_sw",
+          field: "duration",
+          got
+        }) if got == -1.0
+      ),
+      "got {r:?}"
+    );
+  }
+
+  /// FINDING 1: a zero / negative `chunks_sw.step` is rejected as a
+  /// non-positive window parameter. `try_num_output_frames_pyannote`
+  /// only guards `frame_step`, so a zero chunk step would otherwise reach
+  /// `try_count_pyannote` / reconstruct and fail only after clustering.
+  #[test]
+  fn new_rejects_non_positive_chunk_step() {
+    let num_chunks = 1;
+    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    let count = vec![1_u8; count_len(num_chunks)];
+    let chunk_dur = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
+    // step = 0.0 (zero).
+    let zero_step = SlidingWindow::new(0.0, chunk_dur, 0.0);
+    let r = RangeEmbeddings::new(
+      0,
+      num_chunks,
+      seg.clone(),
+      emb.clone(),
+      count.clone(),
+      zero_step,
+      frames_sw(),
+    );
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonPositiveWindowParameter {
+          which: "chunks_sw",
+          field: "step",
+          got
+        }) if got == 0.0
+      ),
+      "got {r:?}"
+    );
+    // step = -1.0 (negative).
+    let neg_step = SlidingWindow::new(0.0, chunk_dur, -1.0);
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, neg_step, frames_sw());
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonPositiveWindowParameter {
+          which: "chunks_sw",
+          field: "step",
+          got
+        }) if got == -1.0
+      ),
+      "got {r:?}"
+    );
+  }
+
+  /// FINDING 1: a non-finite (NaN / +inf) window duration is rejected.
+  /// NaN/inf durations make the output-frame count non-finite (the count
+  /// helper would saturate or reject) and corrupt reconstruct's
+  /// `center_offset`; the full geometry validation rejects them up front.
+  #[test]
+  fn new_rejects_non_finite_duration() {
+    let num_chunks = 1;
+    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    let count = vec![1_u8; count_len(num_chunks)];
+    // NaN chunk duration.
+    let nan_dur = SlidingWindow::new(0.0, f64::NAN, 1.0);
+    let r = RangeEmbeddings::new(
+      0,
+      num_chunks,
+      seg.clone(),
+      emb.clone(),
+      count.clone(),
+      nan_dur,
+      frames_sw(),
+    );
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonPositiveWindowParameter {
+          which: "chunks_sw",
+          field: "duration",
+          got
+        }) if got.is_nan()
+      ),
+      "got {r:?}"
+    );
+    // +inf frame step.
+    let inf_step = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, f64::INFINITY);
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, chunks_sw(), inf_step);
+    assert!(
+      matches!(
+        r,
+        Err(RangeShapeError::NonPositiveWindowParameter {
+          which: "frames_sw",
+          field: "step",
+          got
+        }) if got == f64::INFINITY
+      ),
+      "got {r:?}"
+    );
+  }
+
+  /// A geometry that passes the start/duration/step invariants but whose
+  /// derived output-frame count overflows the cap is rejected as
+  /// `InvalidGeometry` (the residual case after the explicit-invariant
+  /// checks). Enormous `chunk_duration` + tiny `frame_step` saturates the
+  /// `try_num_output_frames_pyannote` cap.
+  #[test]
+  fn new_rejects_uncomputable_count_geometry() {
+    let num_chunks = 1;
+    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK];
+    let emb = vec![0.0_f32; num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM];
+    // All positive + finite + start 0, but the count saturates the cap.
+    let huge_chunks = SlidingWindow::new(0.0, 1.0e15, 1.0);
+    let tiny_frames = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, 1.0e-15);
+    let count = vec![1_u8; 8];
+    let r = RangeEmbeddings::new(0, num_chunks, seg, emb, count, huge_chunks, tiny_frames);
     assert!(
       matches!(r, Err(RangeShapeError::InvalidGeometry)),
       "got {r:?}"
