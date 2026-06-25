@@ -139,6 +139,10 @@ impl SegmentModelOptions {
 pub struct SegmentModel {
   inner: OrtSession,
   input_scratch: Vec<f32>,
+  /// Provenance source: the bundled artifact tag, the loaded-file
+  /// basename, or `None` for an in-memory model. Feeds the dynamic
+  /// version of [`Self::identity`].
+  source: Option<String>,
 }
 
 impl SegmentModel {
@@ -186,7 +190,8 @@ impl SegmentModel {
         path: path.to_path_buf(),
         source,
       })?;
-    Ok(Self::new_from_session(session))
+    let basename = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    Ok(Self::new_from_session(session, basename))
   }
 
   /// Load the model from an in-memory ONNX byte buffer with default options.
@@ -204,7 +209,7 @@ impl SegmentModel {
   pub fn from_memory_with_options(bytes: &[u8], opts: SegmentModelOptions) -> Result<Self, Error> {
     let mut builder = opts.apply(OrtSession::builder()?)?;
     let session = builder.commit_from_memory(bytes)?;
-    Ok(Self::new_from_session(session))
+    Ok(Self::new_from_session(session, None))
   }
 
   /// Load the bundled `pyannote/segmentation-3.0` ONNX with default options.
@@ -243,14 +248,28 @@ impl SegmentModel {
   #[cfg_attr(docsrs, doc(cfg(feature = "bundled-segmentation")))]
   pub fn bundled_with_options(opts: SegmentModelOptions) -> Result<Self, Error> {
     const BUNDLED_BYTES: &[u8] = include_bytes!("../../models/segmentation-3.0.onnx");
-    Self::from_memory_with_options(BUNDLED_BYTES, opts)
+    let mut model = Self::from_memory_with_options(BUNDLED_BYTES, opts)?;
+    model.source = Some(crate::provenance::BUNDLED_SEGMENTATION_VERSION.to_string());
+    Ok(model)
   }
 
-  fn new_from_session(session: OrtSession) -> Self {
+  fn new_from_session(session: OrtSession, source: Option<String>) -> Self {
     Self {
       inner: session,
       input_scratch: Vec::with_capacity(WINDOW_SAMPLES as usize),
+      source,
     }
+  }
+
+  /// The segmentation identity for provenance stamping. Family is
+  /// [`crate::provenance::SEGMENTATION_FAMILY`]; version is the bundled
+  /// tag, the loaded basename, or the family name for an in-memory model.
+  pub fn identity(&self) -> crate::provenance::ModelIdentity {
+    let version = self
+      .source
+      .clone()
+      .unwrap_or_else(|| crate::provenance::SEGMENTATION_FAMILY.to_string());
+    crate::provenance::ModelIdentity::new(crate::provenance::SEGMENTATION_FAMILY, version)
   }
 
   /// Run inference on one 160 000-sample window. Returns the flattened

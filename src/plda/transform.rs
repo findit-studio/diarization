@@ -162,6 +162,33 @@ impl RawEmbedding {
     }
     Ok(Self(arr))
   }
+
+  /// Wrap a raw, **unnormalized** WeSpeaker embedding for the PLDA
+  /// hand-off. This is the public constructor a downstream
+  /// `segment+embed` node uses to carry the embedder's raw 256-d
+  /// output across a service boundary into clustering.
+  ///
+  /// **Invariant:** the input must be the raw, unnormalized WeSpeaker
+  /// output (norm typically in `[0.5, 7]`), NOT the L2-normalized
+  /// [`crate::embed::Embedding`]. PLDA's `xvec_transform` is calibrated
+  /// for the raw distribution; feeding a normalized vector drifts
+  /// clustering off the captured pyannote distribution (see
+  /// `normalized_vs_raw_input_produce_materially_different_output` in
+  /// `src/plda/tests.rs`).
+  ///
+  /// Validation is identical to the internal `from_raw_array`:
+  /// rejects non-finite values ([`Error::NonFiniteInput`]) and
+  /// below-`RAW_EMBEDDING_MIN_NORM` degenerate output
+  /// ([`Error::DegenerateInput`]).
+  pub fn from_wespeaker(arr: [f32; EMBEDDING_DIMENSION]) -> Result<Self, Error> {
+    Self::from_raw_array(arr)
+  }
+
+  /// Borrow the raw, unnormalized 256-d vector. Distinct from
+  /// [`crate::embed::Embedding::as_array`], which is L2-normalized.
+  pub const fn as_array(&self) -> &[f32; EMBEDDING_DIMENSION] {
+    &self.0
+  }
 }
 
 /// Output of [`PldaTransform::xvec_transform`] / input to
@@ -485,6 +512,16 @@ impl PldaTransform {
   pub fn phi(&self) -> &[f64] {
     self.phi.as_slice()
   }
+
+  /// The clustering / PLDA stage identity for provenance stamping —
+  /// the community-1 diarization pipeline. The version is fixed by the
+  /// embedded weights ([`crate::provenance::DIARIZATION_PLDA_VERSION`]).
+  pub fn identity(&self) -> crate::provenance::ModelIdentity {
+    crate::provenance::ModelIdentity::new(
+      crate::provenance::DIARIZATION_FAMILY,
+      crate::provenance::DIARIZATION_PLDA_VERSION,
+    )
+  }
 }
 
 /// In-place L2 normalization with explicit error reporting. Returns
@@ -522,6 +559,32 @@ fn checked_l2_normalize_in_place_with_min(
 #[cfg(test)]
 mod helper_tests {
   use super::*;
+
+  #[test]
+  fn from_wespeaker_accepts_real_norm_and_exposes_array() {
+    // A vector with norm well inside the captured raw range [0.536, 6.97].
+    let mut arr = [0.0_f32; EMBEDDING_DIMENSION];
+    arr[0] = 2.0; // norm 2.0 >> RAW_EMBEDDING_MIN_NORM (0.01)
+    let raw = RawEmbedding::from_wespeaker(arr).expect("valid raw vector");
+    assert_eq!(raw.as_array()[0], 2.0);
+    assert_eq!(raw.as_array().len(), EMBEDDING_DIMENSION);
+  }
+
+  #[test]
+  fn from_wespeaker_rejects_degenerate_and_nonfinite() {
+    let zero = [0.0_f32; EMBEDDING_DIMENSION];
+    assert!(matches!(
+      RawEmbedding::from_wespeaker(zero),
+      Err(Error::DegenerateInput)
+    ));
+    let mut nan = [0.0_f32; EMBEDDING_DIMENSION];
+    nan[0] = 2.0;
+    nan[1] = f32::NAN;
+    assert!(matches!(
+      RawEmbedding::from_wespeaker(nan),
+      Err(Error::NonFiniteInput)
+    ));
+  }
 
   /// Direct test of the near-zero-norm guard. Constructed at the
   /// helper level rather than the public-API level because real f32

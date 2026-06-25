@@ -1,3 +1,43 @@
+# 0.2.0
+
+Raw-embedding hand-off: a desktop `segment+embed` node can now produce
+raw WeSpeaker vectors plus the segmentation/count structure clustering
+needs, and a separate `cluster` node clusters them — preserving the
+raw-not-normalized PLDA invariant and reproducing the bundled
+`StreamingOfflineDiarizer` output bit-for-bit (parity-gated).
+
+ADDED
+
+- `streaming::StreamingEmbedder` — public memory-fused segment+embed
+  node; `push(abs_start, samples) -> streaming::RangeEmbeddings`,
+  `finish()`. Shares the fused per-range body with
+  `StreamingOfflineDiarizer::push_voice_range`; emits RAW, unnormalized
+  WeSpeaker vectors (never L2-normalized).
+- `streaming::RangeEmbeddings` — public per-VAD-range carrier (raw
+  WeSpeaker vectors + segmentation activity + count + timing + absolute
+  start) for a split segment+embed → cluster topology, with a validated
+  constructor (`RangeShapeError`) and accessors.
+- `streaming::cluster_ranges(&[RangeEmbeddings], &PldaTransform, &StreamingOfflineOptions)`
+  — public reduce-at-close clustering entry point; runs the single
+  global pyannote `cluster_vbx` pass and reproduces the bundled
+  `StreamingOfflineDiarizer` output exactly (shared
+  `cluster_ranges_inner`, RNG-free offline path).
+- `plda::RawEmbedding::from_wespeaker` + `as_array` — public,
+  constructible raw (unnormalized) PLDA-input carrier; reuses the
+  existing finite + min-norm validation.
+- `provenance` module — `ModelIdentity` value type + family/version
+  constants; `PldaTransform::identity`, `EmbedModel::identity` (+
+  `source_basename`), `SegmentModel::identity`, so a downstream pipeline
+  reads the loaded model's identity instead of hardcoding it.
+
+CHANGED
+
+- `StreamingOfflineDiarizer` internally accumulates `RangeEmbeddings`
+  carriers and `finalize` delegates to the shared clustering core (pure
+  relocation — no behavior change; streaming + offline unit suites and
+  the 01_dialogue e2e parity remain green).
+
+
 # UNRELEASED
 
 BREAKING (pre-1.0):

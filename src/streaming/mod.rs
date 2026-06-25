@@ -28,8 +28,19 @@
 //! wrong shape — you would need an online clusterer that emits
 //! spans as voice ranges close, which dia does not currently ship.
 
+mod cluster;
 mod offline_diarizer;
+mod range;
 
+#[cfg(feature = "ort")]
+mod embedder;
+
+pub use cluster::cluster_ranges;
 pub use offline_diarizer::{
   DiarizedSpan, StreamingError, StreamingOfflineDiarizer, StreamingOfflineOptions,
 };
+pub use range::{RangeEmbeddings, RangeShapeError};
+
+#[cfg(feature = "ort")]
+#[cfg_attr(docsrs, doc(cfg(feature = "ort")))]
+pub use embedder::StreamingEmbedder;

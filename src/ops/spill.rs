@@ -804,7 +804,21 @@ pub struct SpillBytes<T> {
 }
 
 enum SpillBytesData<T> {
+  /// `Arc<[T]>` heap backend, produced by [`SpillBytesMut::freeze`] on
+  /// the heap path: `SpillBytesMut::zeros` allocates the `Arc<[T]>`
+  /// up front (refcount 1) and `freeze` moves it out unchanged.
   Heap(Arc<[T]>),
+  /// `Arc<Vec<T>>` heap backend that ADOPTS a caller-owned `Vec<T>`
+  /// with no element copy. Produced by [`SpillBytes::from_vec`]: the
+  /// public carrier boundary receives an owned `Vec` built from raw
+  /// model output, and `Arc::new(vec)` wraps it in place — only the
+  /// `Vec`'s three-word header moves into the `Arc` allocation, the
+  /// element buffer is untouched, so `as_slice().as_ptr()` equals the
+  /// original `Vec::as_ptr()`. `Arc<[T]>::from(vec)` would instead
+  /// allocate a fresh `Arc<[T]>` and copy every element (it can't
+  /// reuse the `Vec`'s allocation across the `Vec -> [T]` unsizing),
+  /// re-materializing the buffer we are trying to hand off cheaply.
+  Owned(Arc<Vec<T>>),
   /// Compiled out on `cfg(not(any(unix, windows)))`; see
   /// [`SpillError::UnsupportedTarget`].
   #[cfg(any(unix, windows))]
@@ -815,6 +829,7 @@ impl<T> Clone for SpillBytesData<T> {
   fn clone(&self) -> Self {
     match self {
       SpillBytesData::Heap(arc) => SpillBytesData::Heap(Arc::clone(arc)),
+      SpillBytesData::Owned(arc) => SpillBytesData::Owned(Arc::clone(arc)),
       #[cfg(any(unix, windows))]
       SpillBytesData::Mmap(arc) => SpillBytesData::Mmap(Arc::clone(arc)),
     }
@@ -834,6 +849,42 @@ impl<T> Clone for SpillBytes<T> {
 }
 
 impl<T: Pod> SpillBytes<T> {
+  /// Wrap an owned heap `Vec<T>` as a heap-backed [`SpillBytes`],
+  /// ADOPTING the `Vec`'s existing allocation with **no element copy**.
+  ///
+  /// `Arc::new(v)` moves only the `Vec`'s three-word header (pointer /
+  /// length / capacity) into a fresh `Arc<Vec<T>>` allocation; the
+  /// element buffer the `Vec` points at is left exactly where it was,
+  /// so [`as_slice`](Self::as_slice)`().as_ptr()` equals the original
+  /// `v.as_ptr()`. The result is always the `Owned` heap backend
+  /// ([`is_mmapped`](Self::is_mmapped) is `false`).
+  ///
+  /// This is the genuinely-zero-copy bridge for a call site that
+  /// already owns a heap `Vec` and needs the spill-capable carrier
+  /// type — no round-trip through [`SpillBytesMut::zeros`] +
+  /// `copy_from_slice`, and no `Arc::<[T]>::from(v)` (which would
+  /// allocate a fresh `Arc<[T]>` and copy every element, because the
+  /// `Vec -> [T]` unsizing cannot reuse the `Vec`'s allocation — and
+  /// whose allocation failure aborts the process globally instead of
+  /// being recoverable).
+  ///
+  /// Used at the public `RangeEmbeddings::new` boundary, where the
+  /// caller supplies owned `Vec`s built from raw model output: that
+  /// path is already heap-resident, so nothing is gained by spilling
+  /// it to mmap, and adopting the buffer avoids the transient heap
+  /// duplication a copy would cause. The internal `build_range` path
+  /// instead `freeze`s its existing `SpillBytesMut`, so long ranges
+  /// retain their mmap backing all the way through the carrier.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn from_vec(v: Vec<T>) -> Self {
+    let len = v.len();
+    Self {
+      data: SpillBytesData::Owned(Arc::new(v)),
+      len,
+      _phantom: PhantomData,
+    }
+  }
+
   /// Number of `T` cells in the buffer.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn len(&self) -> usize {
@@ -851,6 +902,7 @@ impl<T: Pod> SpillBytes<T> {
   pub fn as_slice(&self) -> &[T] {
     match &self.data {
       SpillBytesData::Heap(arc) => arc,
+      SpillBytesData::Owned(vec) => &vec[..],
       #[cfg(any(unix, windows))]
       SpillBytesData::Mmap(handle) => {
         let bytes: &[u8] = &handle.map[..];
@@ -863,7 +915,8 @@ impl<T: Pod> SpillBytes<T> {
   }
 
   /// Returns `true` if this buffer is backed by an mmap'd tempfile.
-  /// `false` if it is heap-backed. Always `false` on
+  /// `false` if it is heap-backed (either the `Heap` `Arc<[T]>` or the
+  /// `Owned` `Arc<Vec<T>>` backend). Always `false` on
   /// `cfg(not(any(unix, windows)))` (mmap path is compiled out).
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn is_mmapped(&self) -> bool {
@@ -879,8 +932,10 @@ impl<T: Pod> SpillBytes<T> {
 }
 
 // SAFETY: `SpillBytes<T>` only exposes `&[T]` (no mutation reaches
-// the buffer once frozen). The heap variant wraps `Arc<[T]>` which
-// is `Send + Sync` for `T: Send + Sync`. The mmap variant wraps
+// the buffer once frozen). The `Heap` variant wraps `Arc<[T]>` and the
+// `Owned` variant wraps `Arc<Vec<T>>`; both are `Send + Sync` for
+// `T: Send + Sync` by the standard library's own impls (no raw
+// pointers, no interior mutability). The mmap variant wraps
 // `Arc<MmapHandle>`, which contains `MmapMut + std::fs::File`; both
 // are `Send + Sync` for read-only access (`memmapix` exposes the
 // same `Send + Sync` semantics as `memmap2`). For `T: Pod` (= plain
@@ -1253,5 +1308,80 @@ mod tests {
     assert_send_sync::<SpillBytes<f64>>();
     assert_send_sync::<SpillBytes<f32>>();
     assert_send_sync::<SpillBytes<u8>>();
+  }
+
+  // ── SpillBytes::from_vec: zero-copy Vec adoption ────────────────
+
+  /// FINDING 2: `from_vec` ADOPTS the `Vec`'s existing allocation with
+  /// no element copy — the slice pointer it exposes equals the
+  /// original `Vec::as_ptr()`. Previously `Arc::<[T]>::from(v)`
+  /// allocated a fresh `Arc<[T]>` and copied every element (and an
+  /// allocation failure there aborts the process). The pointer-identity
+  /// assertion is the load-bearing proof that the public carrier
+  /// boundary no longer transiently duplicates the f64 segmentations /
+  /// f32 embeddings.
+  #[test]
+  fn from_vec_is_zero_copy_pointer_identity() {
+    let v: Vec<f64> = (0..1024).map(|i| i as f64 * 0.25).collect();
+    let orig_ptr = v.as_ptr();
+    let orig_len = v.len();
+    let sb = SpillBytes::from_vec(v);
+    assert_eq!(sb.len(), orig_len);
+    assert!(!sb.is_mmapped(), "from_vec is always heap-backed");
+    // The slice the carrier exposes points at the SAME allocation the
+    // original Vec owned — no element copy occurred.
+    assert!(
+      std::ptr::eq(sb.as_slice().as_ptr(), orig_ptr),
+      "from_vec must adopt the Vec's buffer (zero-copy), not copy it"
+    );
+    // Contents intact.
+    for (i, &x) in sb.as_slice().iter().enumerate() {
+      assert_eq!(x, i as f64 * 0.25);
+    }
+  }
+
+  /// Same pointer-identity guarantee for the f32 embeddings carrier
+  /// (the other buffer `RangeEmbeddings::new` wraps via `from_vec`).
+  #[test]
+  fn from_vec_zero_copy_f32() {
+    let v: Vec<f32> = (0..256).map(|i| i as f32).collect();
+    let orig_ptr = v.as_ptr();
+    let sb = SpillBytes::from_vec(v);
+    assert!(std::ptr::eq(sb.as_slice().as_ptr(), orig_ptr));
+  }
+
+  /// A `from_vec` carrier clones cheaply (Arc refcount bump) and every
+  /// clone shares the adopted buffer — same pointer, and the buffer
+  /// outlives the original. Proves the `Owned(Arc<Vec<T>>)` backend
+  /// keeps `SpillBytes`'s O(1)-clone fan-out contract.
+  #[test]
+  fn from_vec_clone_shares_adopted_buffer() {
+    let v: Vec<u8> = (0..64).map(|i| i as u8).collect();
+    let orig_ptr = v.as_ptr();
+    let original = SpillBytes::from_vec(v);
+    let a = original.clone();
+    let b = original.clone();
+    assert!(std::ptr::eq(a.as_slice().as_ptr(), orig_ptr));
+    assert!(std::ptr::eq(a.as_slice().as_ptr(), b.as_slice().as_ptr()));
+    drop(original);
+    // Clones keep the buffer alive after the original is dropped.
+    assert_eq!(a.as_slice(), b.as_slice());
+    for (i, &x) in a.as_slice().iter().enumerate() {
+      assert_eq!(x, i as u8);
+    }
+  }
+
+  /// An empty `Vec` adopts cleanly through `from_vec` (length 0, heap
+  /// backend, no panic). Pointer identity is not asserted for the empty
+  /// case — an empty `Vec`'s dangling `as_ptr()` is not a meaningful
+  /// allocation to compare.
+  #[test]
+  fn from_vec_empty() {
+    let v: Vec<f64> = Vec::new();
+    let sb = SpillBytes::from_vec(v);
+    assert_eq!(sb.len(), 0);
+    assert!(sb.is_empty());
+    assert!(!sb.is_mmapped());
+    assert_eq!(sb.as_slice(), &[] as &[f64]);
   }
 }

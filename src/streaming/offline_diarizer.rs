@@ -63,6 +63,7 @@ use crate::{
     SAMPLE_RATE_HZ, SegmentModel, WINDOW_SAMPLES,
     powerset::{powerset_to_speakers_hard, softmax_row},
   },
+  streaming::RangeEmbeddings,
 };
 
 /// Number of speaker slots per chunk. Same as
@@ -157,6 +158,37 @@ pub enum StreamingShapeError {
   /// `max_iters` exceeds the documented cap. Caught upfront.
   #[error("max_iters ({got}) exceeds cap ({cap})")]
   MaxItersExceedsCap { got: usize, cap: usize },
+  /// A concatenated-tensor length computation overflowed `usize` while
+  /// fanning the accumulated ranges into the single global clustering
+  /// input. `total_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK`,
+  /// `total_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`, or the
+  /// `Σ count.len()` output-frame total exceeded `usize::MAX`. Plain
+  /// `*` / `Σ` would panic in debug or wrap to a small value in
+  /// release (then under-allocate and write out of bounds); reject it
+  /// as a typed error from the `Result`-returning API instead.
+  #[error("concatenated {what} length overflows usize at clustering fan-in")]
+  TotalShapeOverflow {
+    /// Which aggregate overflowed (`"segmentations"` /
+    /// `"raw_embeddings"` / `"output_frames"`).
+    what: &'static str,
+  },
+  /// A per-range scratch-buffer length overflowed `usize` in
+  /// `build_range`. `num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK`
+  /// (segmentations) or `num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`
+  /// (raw embeddings) exceeded `usize::MAX`. Practically unreachable
+  /// (it needs a `num_chunks` that only a >10^15-sample input could
+  /// produce), but plain `*` would wrap in release and silently
+  /// under-allocate the `SpillBytesMut` scratch the fill loop then
+  /// writes past; reject it as a typed error for parity with the
+  /// carrier/cluster boundaries.
+  #[error("per-range {what} scratch length overflows usize for num_chunks {num_chunks}")]
+  RangeShapeOverflow {
+    /// `num_chunks` that triggered the overflow.
+    num_chunks: usize,
+    /// Which product overflowed (`"segmentations"` /
+    /// `"raw_embeddings"`).
+    what: &'static str,
+  },
 }
 
 /// Configuration for [`StreamingOfflineDiarizer`].
@@ -270,36 +302,7 @@ impl DiarizedSpan {
 /// timeline.
 pub struct StreamingOfflineDiarizer {
   options: StreamingOfflineOptions,
-  ranges: Vec<AccumulatedRange>,
-}
-
-/// Per-voice-range derived tensors plus original-timeline anchor.
-struct AccumulatedRange {
-  /// Absolute sample at which this voice range starts in the
-  /// original audio stream. Used to re-anchor output spans.
-  abs_start_sample: u64,
-  /// Number of segmentation chunks emitted within this range.
-  num_chunks: usize,
-  /// Per-(chunk, frame, slot) segmentation activity, flattened
-  /// `[c][f][s]`. Length `num_chunks * FRAMES_PER_WINDOW *
-  /// SLOTS_PER_CHUNK`. f64 to match pyannote internals. Spill-backed
-  /// so very long voice ranges (multi-hour single utterance) don't
-  /// OOM the heap; small ranges stay heap-resident.
-  segmentations: crate::ops::spill::SpillBytesMut<f64>,
-  /// Per-(chunk, slot) raw f32 embeddings, flattened `[c][s][d]`.
-  /// Length `num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM`.
-  /// Spill-backed for the same reason as `segmentations`.
-  raw_embeddings: crate::ops::spill::SpillBytesMut<f32>,
-  /// Per-output-frame instantaneous speaker count, computed by
-  /// `aggregate::count_pyannote` on this range's segmentations.
-  /// `Arc<[u8]>` to avoid a copy from `count_pyannote`'s output;
-  /// also lets `finalize` cheaply hand the per-range buffer to
-  /// downstream stages.
-  count: Arc<[u8]>,
-  /// Output-frame sliding window (local to this range, start = 0).
-  frames_sw_local: SlidingWindow,
-  /// Chunk-level sliding window (local to this range, start = 0).
-  chunks_sw_local: SlidingWindow,
+  ranges: Vec<RangeEmbeddings>,
 }
 
 impl StreamingOfflineDiarizer {
@@ -349,231 +352,14 @@ impl StreamingOfflineDiarizer {
     abs_start_sample: u64,
     samples: &[f32],
   ) -> Result<(), StreamingError> {
-    let cfg = &self.options.diarization;
-    if samples.is_empty() {
-      return Err(StreamingShapeError::EmptyVoiceRange.into());
-    }
-    let win = WINDOW_SAMPLES as usize;
-    let step = cfg.step_samples() as usize;
-    if step == 0 {
-      return Err(StreamingShapeError::ZeroStepSamples.into());
-    }
-    // Defense-in-depth: `OwnedPipelineOptions::with_step_samples`
-    // panics on > WINDOW_SAMPLES, but serde-deserialized configs
-    // bypass that path. See StreamingShapeError::StepSamplesExceedsWindow.
-    if step > win {
-      return Err(
-        StreamingShapeError::StepSamplesExceedsWindow {
-          step: cfg.step_samples(),
-          window: WINDOW_SAMPLES,
-        }
-        .into(),
-      );
-    }
-    // Same defense-in-depth for onset.
-    if !crate::offline::check_onset(cfg.onset()) {
-      return Err(StreamingShapeError::OnsetOutOfRange { onset: cfg.onset() }.into());
-    }
-    if !crate::offline::check_min_duration_off(cfg.min_duration_off()) {
-      return Err(
-        StreamingShapeError::MinDurationOffOutOfRange {
-          value: cfg.min_duration_off(),
-        }
-        .into(),
-      );
-    }
-    if !crate::offline::check_smoothing_epsilon(cfg.smoothing_epsilon()) {
-      return Err(
-        StreamingShapeError::SmoothingEpsilonOutOfRange {
-          value: cfg.smoothing_epsilon(),
-        }
-        .into(),
-      );
-    }
-    // Preflight clustering hyperparameters BEFORE running per-range
-    // segmentation + embedding inference. `finalize` re-validates,
-    // but a misconfigured `threshold`/`fa`/`fb`/`max_iters` would
-    // otherwise burn every range's model-inference pass before
-    // failing at the global clustering boundary. Surface the error
-    // upfront on the first `push_voice_range` call.
-    if !cfg.threshold().is_finite() || cfg.threshold() <= 0.0 {
-      return Err(
-        StreamingShapeError::InvalidThreshold {
-          value: cfg.threshold(),
-        }
-        .into(),
-      );
-    }
-    if !cfg.fa().is_finite() || cfg.fa() <= 0.0 {
-      return Err(StreamingShapeError::InvalidFa { value: cfg.fa() }.into());
-    }
-    if !cfg.fb().is_finite() || cfg.fb() <= 0.0 {
-      return Err(StreamingShapeError::InvalidFb { value: cfg.fb() }.into());
-    }
-    if cfg.max_iters() == 0 {
-      return Err(StreamingShapeError::ZeroMaxIters.into());
-    }
-    if cfg.max_iters() > crate::cluster::vbx::MAX_ITERS_CAP {
-      return Err(
-        StreamingShapeError::MaxItersExceedsCap {
-          got: cfg.max_iters(),
-          cap: crate::cluster::vbx::MAX_ITERS_CAP,
-        }
-        .into(),
-      );
-    }
-
-    let num_chunks = if samples.len() <= win {
-      1
-    } else {
-      (samples.len() - win).div_ceil(step) + 1
-    };
-
-    let mut padded_chunk = vec![0.0_f32; win];
-    // Spill-back per-range tensors: a single voice range that runs
-    // for hours would otherwise OOM the heap. See
-    // `OwnedDiarizationPipeline::run` for the same pattern.
-    let segs_len = num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
-    let mut segmentations = crate::ops::spill::SpillBytesMut::<f64>::zeros(
-      segs_len,
-      self.options.diarization.spill_options(),
-    )?;
-    {
-      let segs = segmentations.as_mut_slice();
-
-      // ── Stage 1: chunked sliding-window segmentation ───────────────
-      for c in 0..num_chunks {
-        let chunk_start = c * step;
-        padded_chunk.fill(0.0);
-        let end = (chunk_start + win).min(samples.len());
-        let lo = chunk_start.min(samples.len());
-        let n = end - lo;
-        if n > 0 {
-          padded_chunk[..n].copy_from_slice(&samples[lo..end]);
-        }
-
-        let logits = seg_model
-          .infer(&padded_chunk)
-          .map_err(|e| StreamingError::Segment(format!("{e}")))?;
-        for f in 0..FRAMES_PER_WINDOW {
-          let mut row = [0.0_f32; POWERSET_CLASSES];
-          for k in 0..POWERSET_CLASSES {
-            row[k] = logits[f * POWERSET_CLASSES + k];
-          }
-          let probs = softmax_row(&row);
-          // Pyannote's `to_multilabel(soft=False)` — see the long
-          // comment in `crate::offline::owned::OwnedDiarizationPipeline
-          // ::run` stage 1 for the rationale.
-          let speakers = powerset_to_speakers_hard(&probs);
-          for s in 0..SLOTS_PER_CHUNK {
-            segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = speakers[s] as f64;
-          }
-        }
-      }
-    }
-
-    // ── Stage 2: per-(chunk, slot) masked embedding ────────────────
-    let emb_len = num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
-    let mut raw_embeddings = crate::ops::spill::SpillBytesMut::<f32>::zeros(
-      emb_len,
-      self.options.diarization.spill_options(),
-    )?;
-    {
-      let segs = segmentations.as_mut_slice();
-      let embs = raw_embeddings.as_mut_slice();
-
-      for c in 0..num_chunks {
-        let chunk_start = c * step;
-        padded_chunk.fill(0.0);
-        let end = (chunk_start + win).min(samples.len());
-        let lo = chunk_start.min(samples.len());
-        let n = end - lo;
-        if n > 0 {
-          padded_chunk[..n].copy_from_slice(&samples[lo..end]);
-        }
-
-        for s in 0..SLOTS_PER_CHUNK {
-          let mut frame_mask = [false; FRAMES_PER_WINDOW];
-          let mut any_active = false;
-          for f in 0..FRAMES_PER_WINDOW {
-            let active =
-              segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] >= cfg.onset() as f64;
-            frame_mask[f] = active;
-            any_active |= active;
-          }
-          if !any_active {
-            for f in 0..FRAMES_PER_WINDOW {
-              segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
-            }
-            continue;
-          }
-
-          let raw = match embed_model.embed_chunk_with_frame_mask(&padded_chunk, &frame_mask) {
-            Ok(v) => v,
-            Err(crate::embed::Error::InvalidClip { .. })
-            | Err(crate::embed::Error::DegenerateEmbedding) => {
-              for f in 0..FRAMES_PER_WINDOW {
-                segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
-              }
-              continue;
-            }
-            Err(e) => return Err(StreamingError::Embed(format!("{e}"))),
-          };
-          // Reject non-finite embedding output as a hard error. Mirrors
-          // `offline::owned`'s split: NaN/inf is upstream corruption that
-          // must surface, not get silently drop-listed as "inactive
-          // speaker" alongside legitimate low-norm vectors.
-          if raw.iter().any(|v| !v.is_finite()) {
-            return Err(StreamingError::Embed(format!(
-              "{}",
-              crate::embed::Error::NonFiniteOutput
-            )));
-          }
-          let norm_sq: f64 = raw.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
-          if norm_sq.sqrt() < 0.01 {
-            for f in 0..FRAMES_PER_WINDOW {
-              segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
-            }
-            continue;
-          }
-          let dst = (c * SLOTS_PER_CHUNK + s) * EMBEDDING_DIM;
-          embs[dst..dst + EMBEDDING_DIM].copy_from_slice(&raw);
-        }
-      }
-    }
-
-    // ── Stage 3: count tensor (local to this range) ────────────────
-    let chunk_duration_s = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
-    let chunk_step_s = cfg.step_samples() as f64 / SAMPLE_RATE_HZ as f64;
-    let chunks_sw_local = SlidingWindow::new(0.0, chunk_duration_s, chunk_step_s);
-    let frames_sw_template =
-      SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
-    // Use the fallible variant: a malformed `onset` (NaN/inf via the
-    // public `with_onset` builder) would panic the infallible wrapper
-    // at `try_count_pyannote.expect(...)`. Surface it as a typed
-    // `StreamingError::Aggregate` so untrusted config can never crash.
-    let (count, frames_sw_local) = try_count_pyannote(
-      segmentations.as_slice(),
-      num_chunks,
-      FRAMES_PER_WINDOW,
-      SLOTS_PER_CHUNK,
-      cfg.onset() as f64,
-      chunks_sw_local,
-      frames_sw_template,
-      self.options.diarization.spill_options(),
-    )?
-    .into_parts();
-
-    self.ranges.push(AccumulatedRange {
+    let range = build_range(
+      &self.options,
+      seg_model,
+      embed_model,
       abs_start_sample,
-      num_chunks,
-      segmentations,
-      raw_embeddings,
-      count,
-      frames_sw_local,
-      chunks_sw_local,
-    });
-
+      samples,
+    )?;
+    self.ranges.push(range);
     Ok(())
   }
 
@@ -601,179 +387,7 @@ impl StreamingOfflineDiarizer {
   /// - All other errors propagate from `diarize_offline` /
   ///   `reconstruct`.
   pub fn finalize(&self, plda: &PldaTransform) -> Result<Arc<[DiarizedSpan]>, StreamingError> {
-    if self.ranges.is_empty() {
-      return Ok(Arc::from([] as [DiarizedSpan; 0]));
-    }
-    let total_chunks: usize = self.ranges.iter().map(|r| r.num_chunks).sum();
-    if total_chunks == 0 {
-      return Err(StreamingShapeError::AllRangesEmpty.into());
-    }
-
-    // ── 1. Concatenate per-range tensors ───────────────────────────
-    //
-    // The concatenated tensors are the dominant memory footprint at
-    // multi-hour scale: `all_segs` ≈ 50 MB / hour, plus
-    // `all_emb` ≈ 11 MB / hour. Both cross the 64 MiB default
-    // threshold past ~5 h of accumulated voice. Spill-back so we
-    // don't OOM the heap.
-    let total_segs_len = total_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
-    let total_emb_len = total_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
-    let mut all_segs = crate::ops::spill::SpillBytesMut::<f64>::zeros(
-      total_segs_len,
-      self.options.diarization.spill_options(),
-    )?;
-    let mut all_emb = crate::ops::spill::SpillBytesMut::<f32>::zeros(
-      total_emb_len,
-      self.options.diarization.spill_options(),
-    )?;
-    {
-      let segs = all_segs.as_mut_slice();
-      let embs = all_emb.as_mut_slice();
-      let mut s_off = 0;
-      let mut e_off = 0;
-      for r in &self.ranges {
-        let s_n = r.segmentations.len();
-        segs[s_off..s_off + s_n].copy_from_slice(r.segmentations.as_slice());
-        s_off += s_n;
-        let e_n = r.raw_embeddings.len();
-        embs[e_off..e_off + e_n].copy_from_slice(r.raw_embeddings.as_slice());
-        e_off += e_n;
-      }
-    }
-
-    // ── 2. Concatenate count tensors (per-range adjacent in output) ─
-    let total_output_frames: usize = self.ranges.iter().map(|r| r.count.len()).sum();
-    let mut all_count = crate::ops::spill::SpillBytesMut::<u8>::zeros(
-      total_output_frames,
-      self.options.diarization.spill_options(),
-    )?;
-    {
-      let buf = all_count.as_mut_slice();
-      let mut off = 0;
-      for r in &self.ranges {
-        let n = r.count.len();
-        buf[off..off + n].copy_from_slice(&r.count);
-        off += n;
-      }
-    }
-
-    // ── 3. Run global cluster_vbx via diarize_offline ──────────────
-    //
-    // `diarize_offline`'s reconstruct stage uses `chunks_sw` /
-    // `frames_sw` to map per-chunk frames onto the global output
-    // grid. With our concatenated chunks (which have non-uniform
-    // gaps in absolute time), this global reconstruct would emit
-    // garbage timings. So we ignore its reconstruct output and
-    // re-reconstruct per range below.
-    let cfg = &self.options.diarization;
-    let chunks_sw_global = self.ranges[0].chunks_sw_local;
-    let frames_sw_global = self.ranges[0].frames_sw_local;
-    let input = OfflineInput::new(
-      all_emb.as_slice(),
-      total_chunks,
-      SLOTS_PER_CHUNK,
-      all_segs.as_slice(),
-      FRAMES_PER_WINDOW,
-      all_count.as_slice(),
-      total_output_frames,
-      chunks_sw_global,
-      frames_sw_global,
-      plda,
-    )
-    .with_threshold(cfg.threshold())
-    .with_fa(cfg.fa())
-    .with_fb(cfg.fb())
-    .with_max_iters(cfg.max_iters())
-    .with_min_duration_off(cfg.min_duration_off())
-    .with_smoothing_epsilon(cfg.smoothing_epsilon())
-    .with_spill_options(self.options.diarization.spill_options().clone());
-    let offline_out = diarize_offline(&input)?;
-    let hard_clusters = offline_out.hard_clusters();
-    let num_clusters = offline_out.num_clusters();
-    debug_assert_eq!(hard_clusters.len(), total_chunks);
-
-    // ── 4. Per-range reconstruct → spans → original timeline ───────
-    //
-    // `reconstruct` sizes its output grid as `(num_output_frames,
-    // num_clusters_local)` where `num_clusters_local =
-    // max(max(hard_clusters_slice) + 1, max(count_slice), 1)`. We
-    // recompute it the same way so `discrete_to_spans`'s shape
-    // assertion holds. Span cluster ids are the global hard-cluster
-    // ids regardless of `num_clusters_local`, so cross-range identity
-    // is preserved automatically.
-    let _ = num_clusters; // global count not used here; per-range computed below.
-    let mut all_spans: Vec<DiarizedSpan> = Vec::new();
-    let sr = SAMPLE_RATE_HZ as f64;
-    let mut chunk_offset = 0usize;
-    for r in &self.ranges {
-      let hc_slice = &hard_clusters[chunk_offset..chunk_offset + r.num_chunks];
-      chunk_offset += r.num_chunks;
-
-      let recon_input = ReconstructInput::new(
-        r.segmentations.as_slice(),
-        r.num_chunks,
-        FRAMES_PER_WINDOW,
-        SLOTS_PER_CHUNK,
-        hc_slice,
-        &r.count,
-        r.count.len(),
-        r.chunks_sw_local,
-        r.frames_sw_local,
-      )
-      .with_smoothing_epsilon(cfg.smoothing_epsilon())
-      .with_spill_options(self.options.diarization.spill_options().clone());
-      let discrete = reconstruct_grid(&recon_input)?;
-
-      let max_cluster_local = hc_slice
-        .iter()
-        .flat_map(|row| row.iter())
-        .copied()
-        .max()
-        .unwrap_or(-1);
-      let max_count_local = r.count.iter().copied().max().unwrap_or(0) as usize;
-      let num_clusters_local = if max_cluster_local < 0 {
-        // No assigned clusters → reconstruct returns a 1D
-        // `num_output_frames`-length zero vector (see
-        // `reconstruct::algo::reconstruct` early-out at
-        // `max_cluster < 0`). `discrete_to_spans` would then assert
-        // on `grid.len() == num_output_frames * num_clusters`, so
-        // skip the call entirely.
-        debug_assert_eq!(discrete.len(), r.count.len());
-        continue;
-      } else {
-        ((max_cluster_local + 1) as usize).max(max_count_local.max(1))
-      };
-
-      let local_spans: Vec<RttmSpan> = discrete_to_spans(
-        discrete.as_slice(),
-        r.count.len(),
-        num_clusters_local,
-        r.frames_sw_local,
-        cfg.min_duration_off(),
-      );
-
-      for span in local_spans {
-        let start_off_samples = (span.start() * sr).max(0.0) as u64;
-        let dur_samples = (span.duration() * sr).max(0.0) as u64;
-        all_spans.push(DiarizedSpan {
-          start_sample: r.abs_start_sample.saturating_add(start_off_samples),
-          end_sample: r
-            .abs_start_sample
-            .saturating_add(start_off_samples)
-            .saturating_add(dur_samples),
-          speaker_id: span.cluster() as u32,
-        });
-      }
-    }
-
-    // Sort by start time so callers can stream the output in order.
-    all_spans.sort_by_key(|s| s.start_sample);
-    // One-time `Vec`→`Arc<[T]>` copy at the boundary. `all_spans` is
-    // built by `Vec::push` because span count is unknown a-priori
-    // (it depends on per-range `discrete_to_spans` output); converting
-    // to `Arc<[DiarizedSpan]>` lets downstream consumers fan out
-    // cheaply via `Arc::clone`.
-    Ok(Arc::from(all_spans))
+    cluster_ranges_inner(&self.ranges, &self.options, plda)
   }
 
   /// Drop accumulated tensors. Useful for reusing the same diarizer
@@ -781,6 +395,516 @@ impl StreamingOfflineDiarizer {
   /// since IDs are decided at `finalize`-time, not held as state.
   pub fn reset(&mut self) {
     self.ranges.clear();
+  }
+}
+
+/// Run the fused segmentation + masked-embedding + count pipeline on one
+/// voice range and return the public [`RangeEmbeddings`] carrier. Shared
+/// by [`StreamingOfflineDiarizer::push_voice_range`] (which accumulates
+/// the carrier internally) and
+/// [`crate::streaming::StreamingEmbedder::push`] (which hands it to the
+/// caller). Emits RAW, unnormalized WeSpeaker vectors — never
+/// L2-normalized.
+pub(crate) fn build_range(
+  options: &StreamingOfflineOptions,
+  seg_model: &mut SegmentModel,
+  embed_model: &mut EmbedModel,
+  abs_start_sample: u64,
+  samples: &[f32],
+) -> Result<RangeEmbeddings, StreamingError> {
+  let cfg = options.diarization();
+  if samples.is_empty() {
+    return Err(StreamingShapeError::EmptyVoiceRange.into());
+  }
+  let win = WINDOW_SAMPLES as usize;
+  let step = cfg.step_samples() as usize;
+  if step == 0 {
+    return Err(StreamingShapeError::ZeroStepSamples.into());
+  }
+  // Defense-in-depth: `OwnedPipelineOptions::with_step_samples`
+  // panics on > WINDOW_SAMPLES, but serde-deserialized configs
+  // bypass that path. See StreamingShapeError::StepSamplesExceedsWindow.
+  if step > win {
+    return Err(
+      StreamingShapeError::StepSamplesExceedsWindow {
+        step: cfg.step_samples(),
+        window: WINDOW_SAMPLES,
+      }
+      .into(),
+    );
+  }
+  // Same defense-in-depth for onset.
+  if !crate::offline::check_onset(cfg.onset()) {
+    return Err(StreamingShapeError::OnsetOutOfRange { onset: cfg.onset() }.into());
+  }
+  if !crate::offline::check_min_duration_off(cfg.min_duration_off()) {
+    return Err(
+      StreamingShapeError::MinDurationOffOutOfRange {
+        value: cfg.min_duration_off(),
+      }
+      .into(),
+    );
+  }
+  if !crate::offline::check_smoothing_epsilon(cfg.smoothing_epsilon()) {
+    return Err(
+      StreamingShapeError::SmoothingEpsilonOutOfRange {
+        value: cfg.smoothing_epsilon(),
+      }
+      .into(),
+    );
+  }
+  // Preflight clustering hyperparameters BEFORE running per-range
+  // segmentation + embedding inference. `finalize` re-validates,
+  // but a misconfigured `threshold`/`fa`/`fb`/`max_iters` would
+  // otherwise burn every range's model-inference pass before
+  // failing at the global clustering boundary. Surface the error
+  // upfront on the first `push_voice_range` call.
+  if !cfg.threshold().is_finite() || cfg.threshold() <= 0.0 {
+    return Err(
+      StreamingShapeError::InvalidThreshold {
+        value: cfg.threshold(),
+      }
+      .into(),
+    );
+  }
+  if !cfg.fa().is_finite() || cfg.fa() <= 0.0 {
+    return Err(StreamingShapeError::InvalidFa { value: cfg.fa() }.into());
+  }
+  if !cfg.fb().is_finite() || cfg.fb() <= 0.0 {
+    return Err(StreamingShapeError::InvalidFb { value: cfg.fb() }.into());
+  }
+  if cfg.max_iters() == 0 {
+    return Err(StreamingShapeError::ZeroMaxIters.into());
+  }
+  if cfg.max_iters() > crate::cluster::vbx::MAX_ITERS_CAP {
+    return Err(
+      StreamingShapeError::MaxItersExceedsCap {
+        got: cfg.max_iters(),
+        cap: crate::cluster::vbx::MAX_ITERS_CAP,
+      }
+      .into(),
+    );
+  }
+
+  let num_chunks = if samples.len() <= win {
+    1
+  } else {
+    (samples.len() - win).div_ceil(step) + 1
+  };
+
+  let mut padded_chunk = vec![0.0_f32; win];
+  // Spill-back per-range tensors: a single voice range that runs
+  // for hours would otherwise OOM the heap. See
+  // `OwnedDiarizationPipeline::run` for the same pattern. Checked
+  // shape arithmetic for parity with the carrier/cluster boundaries:
+  // a wrapped `segs_len` would under-allocate the scratch the fill
+  // loop below then writes past.
+  let segs_len = num_chunks
+    .checked_mul(FRAMES_PER_WINDOW)
+    .and_then(|n| n.checked_mul(SLOTS_PER_CHUNK))
+    .ok_or(StreamingShapeError::RangeShapeOverflow {
+      num_chunks,
+      what: "segmentations",
+    })?;
+  let mut segmentations = crate::ops::spill::SpillBytesMut::<f64>::zeros(
+    segs_len,
+    options.diarization().spill_options(),
+  )?;
+  {
+    let segs = segmentations.as_mut_slice();
+
+    // ── Stage 1: chunked sliding-window segmentation ───────────────
+    for c in 0..num_chunks {
+      let chunk_start = c * step;
+      padded_chunk.fill(0.0);
+      let end = (chunk_start + win).min(samples.len());
+      let lo = chunk_start.min(samples.len());
+      let n = end - lo;
+      if n > 0 {
+        padded_chunk[..n].copy_from_slice(&samples[lo..end]);
+      }
+
+      let logits = seg_model
+        .infer(&padded_chunk)
+        .map_err(|e| StreamingError::Segment(format!("{e}")))?;
+      for f in 0..FRAMES_PER_WINDOW {
+        let mut row = [0.0_f32; POWERSET_CLASSES];
+        for k in 0..POWERSET_CLASSES {
+          row[k] = logits[f * POWERSET_CLASSES + k];
+        }
+        let probs = softmax_row(&row);
+        // Pyannote's `to_multilabel(soft=False)` — see the long
+        // comment in `crate::offline::owned::OwnedDiarizationPipeline
+        // ::run` stage 1 for the rationale.
+        let speakers = powerset_to_speakers_hard(&probs);
+        for s in 0..SLOTS_PER_CHUNK {
+          segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = speakers[s] as f64;
+        }
+      }
+    }
+  }
+
+  // ── Stage 2: per-(chunk, slot) masked embedding ────────────────
+  let emb_len = num_chunks
+    .checked_mul(SLOTS_PER_CHUNK)
+    .and_then(|n| n.checked_mul(EMBEDDING_DIM))
+    .ok_or(StreamingShapeError::RangeShapeOverflow {
+      num_chunks,
+      what: "raw_embeddings",
+    })?;
+  let mut raw_embeddings =
+    crate::ops::spill::SpillBytesMut::<f32>::zeros(emb_len, options.diarization().spill_options())?;
+  {
+    let segs = segmentations.as_mut_slice();
+    let embs = raw_embeddings.as_mut_slice();
+
+    for c in 0..num_chunks {
+      let chunk_start = c * step;
+      padded_chunk.fill(0.0);
+      let end = (chunk_start + win).min(samples.len());
+      let lo = chunk_start.min(samples.len());
+      let n = end - lo;
+      if n > 0 {
+        padded_chunk[..n].copy_from_slice(&samples[lo..end]);
+      }
+
+      for s in 0..SLOTS_PER_CHUNK {
+        let mut frame_mask = [false; FRAMES_PER_WINDOW];
+        let mut any_active = false;
+        for f in 0..FRAMES_PER_WINDOW {
+          let active =
+            segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] >= cfg.onset() as f64;
+          frame_mask[f] = active;
+          any_active |= active;
+        }
+        if !any_active {
+          for f in 0..FRAMES_PER_WINDOW {
+            segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
+          }
+          continue;
+        }
+
+        let raw = match embed_model.embed_chunk_with_frame_mask(&padded_chunk, &frame_mask) {
+          Ok(v) => v,
+          Err(crate::embed::Error::InvalidClip { .. })
+          | Err(crate::embed::Error::DegenerateEmbedding) => {
+            for f in 0..FRAMES_PER_WINDOW {
+              segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
+            }
+            continue;
+          }
+          Err(e) => return Err(StreamingError::Embed(format!("{e}"))),
+        };
+        // Reject non-finite embedding output as a hard error. Mirrors
+        // `offline::owned`'s split: NaN/inf is upstream corruption that
+        // must surface, not get silently drop-listed as "inactive
+        // speaker" alongside legitimate low-norm vectors.
+        if raw.iter().any(|v| !v.is_finite()) {
+          return Err(StreamingError::Embed(format!(
+            "{}",
+            crate::embed::Error::NonFiniteOutput
+          )));
+        }
+        let norm_sq: f64 = raw.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        if norm_sq.sqrt() < 0.01 {
+          for f in 0..FRAMES_PER_WINDOW {
+            segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
+          }
+          continue;
+        }
+        let dst = (c * SLOTS_PER_CHUNK + s) * EMBEDDING_DIM;
+        embs[dst..dst + EMBEDDING_DIM].copy_from_slice(&raw);
+      }
+    }
+  }
+
+  // ── Stage 3: count tensor (local to this range) ────────────────
+  let chunk_duration_s = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
+  let chunk_step_s = cfg.step_samples() as f64 / SAMPLE_RATE_HZ as f64;
+  let chunks_sw_local = SlidingWindow::new(0.0, chunk_duration_s, chunk_step_s);
+  let frames_sw_template =
+    SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
+  // Use the fallible variant: a malformed `onset` (NaN/inf via the
+  // public `with_onset` builder) would panic the infallible wrapper
+  // at `try_count_pyannote.expect(...)`. Surface it as a typed
+  // `StreamingError::Aggregate` so untrusted config can never crash.
+  let (count, frames_sw_local) = try_count_pyannote(
+    segmentations.as_slice(),
+    num_chunks,
+    FRAMES_PER_WINDOW,
+    SLOTS_PER_CHUNK,
+    cfg.onset() as f64,
+    chunks_sw_local,
+    frames_sw_template,
+    options.diarization().spill_options(),
+  )?
+  .into_parts();
+
+  // Freeze the spill-backed scratch buffers into the carrier instead
+  // of `to_vec`-ing them onto the heap. `freeze` is zero-copy on both
+  // backends (heap moves the refcount-1 `Arc<[T]>`; mmap wraps the
+  // existing mapping in an `Arc`), so a multi-hour voice range whose
+  // `segmentations` / `raw_embeddings` spilled to a file-backed mmap
+  // stays file-backed all the way through `RangeEmbeddings` — both the
+  // bundled `StreamingOfflineDiarizer` (which stores the carrier) and
+  // the split `cluster_ranges` path retain it without an unbounded
+  // heap copy. `count` is already `Arc<[u8]>` from `count_pyannote`.
+  Ok(RangeEmbeddings::from_spill_parts(
+    abs_start_sample,
+    num_chunks,
+    segmentations.freeze(),
+    raw_embeddings.freeze(),
+    count,
+    chunks_sw_local,
+    frames_sw_local,
+  ))
+}
+
+/// Shared cluster-and-reconstruct core used by both
+/// [`StreamingOfflineDiarizer::finalize`] and the public
+/// [`crate::streaming::cluster_ranges`] entry point. Concatenates all
+/// ranges' tensors, runs the single global `diarize_offline` pass, then
+/// re-reconstructs per range on its local timing and re-anchors spans to
+/// the original stream. Deterministic — `diarize_offline` has no RNG, so
+/// identical inputs produce identical spans.
+pub(crate) fn cluster_ranges_inner(
+  ranges: &[RangeEmbeddings],
+  options: &StreamingOfflineOptions,
+  plda: &PldaTransform,
+) -> Result<Arc<[DiarizedSpan]>, StreamingError> {
+  if ranges.is_empty() {
+    return Ok(Arc::from([] as [DiarizedSpan; 0]));
+  }
+  // Checked sum: each range's `num_chunks` is bounded (its
+  // segmentations buffer of `num_chunks * FRAMES_PER_WINDOW *
+  // SLOTS_PER_CHUNK` cells already exists in memory), but an
+  // adversarial slice of many ranges could overflow the running total
+  // — which would panic in debug or wrap in release before the
+  // products below. Fold with `checked_add`.
+  let total_chunks: usize = ranges.iter().try_fold(0usize, |acc, r| {
+    acc
+      .checked_add(r.num_chunks())
+      .ok_or(StreamingShapeError::TotalShapeOverflow {
+        what: "segmentations",
+      })
+  })?;
+  if total_chunks == 0 {
+    return Err(StreamingShapeError::AllRangesEmpty.into());
+  }
+  let spill = options.diarization().spill_options();
+
+  // ── 1. Concatenate per-range tensors ───────────────────────────
+  //
+  // The concatenated tensors are the dominant memory footprint at
+  // multi-hour scale: `all_segs` ≈ 50 MB / hour, plus
+  // `all_emb` ≈ 11 MB / hour. Both cross the 64 MiB default
+  // threshold past ~5 h of accumulated voice. Spill-back so we
+  // don't OOM the heap.
+  // Checked shape arithmetic at the cluster-aggregation boundary: a
+  // huge `total_chunks` overflows these products. Plain `*` panics in
+  // debug and wraps to a small value in release — the wrapped length
+  // would under-allocate `all_segs` / `all_emb`, then the
+  // `copy_from_slice` fan-in below writes out of bounds. Surface the
+  // overflow as a typed error from this `Result`-returning API.
+  let total_segs_len = total_chunks
+    .checked_mul(FRAMES_PER_WINDOW)
+    .and_then(|n| n.checked_mul(SLOTS_PER_CHUNK))
+    .ok_or(StreamingShapeError::TotalShapeOverflow {
+      what: "segmentations",
+    })?;
+  let total_emb_len = total_chunks
+    .checked_mul(SLOTS_PER_CHUNK)
+    .and_then(|n| n.checked_mul(EMBEDDING_DIM))
+    .ok_or(StreamingShapeError::TotalShapeOverflow {
+      what: "raw_embeddings",
+    })?;
+  let mut all_segs = crate::ops::spill::SpillBytesMut::<f64>::zeros(total_segs_len, spill)?;
+  let mut all_emb = crate::ops::spill::SpillBytesMut::<f32>::zeros(total_emb_len, spill)?;
+  {
+    let segs = all_segs.as_mut_slice();
+    let embs = all_emb.as_mut_slice();
+    let mut s_off = 0;
+    let mut e_off = 0;
+    for r in ranges {
+      let s_n = r.segmentations().len();
+      segs[s_off..s_off + s_n].copy_from_slice(r.segmentations());
+      s_off += s_n;
+      let e_n = r.raw_embeddings().len();
+      embs[e_off..e_off + e_n].copy_from_slice(r.raw_embeddings());
+      e_off += e_n;
+    }
+  }
+
+  // ── 2. Concatenate count tensors (per-range adjacent in output) ─
+  // Checked sum for the same reason as `total_chunks`: each range's
+  // `count` buffer already exists, but the running total over an
+  // adversarial slice could overflow before `SpillBytesMut::zeros`.
+  let total_output_frames: usize = ranges.iter().try_fold(0usize, |acc, r| {
+    acc
+      .checked_add(r.count().len())
+      .ok_or(StreamingShapeError::TotalShapeOverflow {
+        what: "output_frames",
+      })
+  })?;
+  let mut all_count = crate::ops::spill::SpillBytesMut::<u8>::zeros(total_output_frames, spill)?;
+  {
+    let buf = all_count.as_mut_slice();
+    let mut off = 0;
+    for r in ranges {
+      let n = r.count().len();
+      buf[off..off + n].copy_from_slice(r.count());
+      off += n;
+    }
+  }
+
+  // ── 3. Run global cluster_vbx via diarize_offline ──────────────
+  //
+  // `diarize_offline`'s reconstruct stage uses `chunks_sw` /
+  // `frames_sw` to map per-chunk frames onto the global output
+  // grid. With our concatenated chunks (which have non-uniform
+  // gaps in absolute time), this global reconstruct would emit
+  // garbage timings. So we ignore its reconstruct output and
+  // re-reconstruct per range below.
+  let cfg = options.diarization();
+  let chunks_sw_global = ranges[0].chunks_sw();
+  let frames_sw_global = ranges[0].frames_sw();
+  let input = OfflineInput::new(
+    all_emb.as_slice(),
+    total_chunks,
+    SLOTS_PER_CHUNK,
+    all_segs.as_slice(),
+    FRAMES_PER_WINDOW,
+    all_count.as_slice(),
+    total_output_frames,
+    chunks_sw_global,
+    frames_sw_global,
+    plda,
+  )
+  .with_threshold(cfg.threshold())
+  .with_fa(cfg.fa())
+  .with_fb(cfg.fb())
+  .with_max_iters(cfg.max_iters())
+  .with_min_duration_off(cfg.min_duration_off())
+  .with_smoothing_epsilon(cfg.smoothing_epsilon())
+  .with_spill_options(spill.clone());
+  let offline_out = diarize_offline(&input)?;
+  let hard_clusters = offline_out.hard_clusters();
+  debug_assert_eq!(hard_clusters.len(), total_chunks);
+
+  // ── 4. Per-range reconstruct → spans → original timeline ───────
+  //
+  // `reconstruct` sizes its output grid as `(num_output_frames,
+  // num_clusters_local)` where `num_clusters_local =
+  // max(max(hard_clusters_slice) + 1, max(count_slice), 1)`. We
+  // recompute it the same way so `discrete_to_spans`'s shape
+  // assertion holds. Span cluster ids are the global hard-cluster
+  // ids regardless of `num_clusters_local`, so cross-range identity
+  // is preserved automatically.
+  let mut all_spans: Vec<DiarizedSpan> = Vec::new();
+  let sr = SAMPLE_RATE_HZ as f64;
+  let mut chunk_offset = 0usize;
+  for r in ranges {
+    let hc_slice = &hard_clusters[chunk_offset..chunk_offset + r.num_chunks()];
+    chunk_offset += r.num_chunks();
+
+    let recon_input = ReconstructInput::new(
+      r.segmentations(),
+      r.num_chunks(),
+      FRAMES_PER_WINDOW,
+      SLOTS_PER_CHUNK,
+      hc_slice,
+      r.count(),
+      r.count().len(),
+      r.chunks_sw(),
+      r.frames_sw(),
+    )
+    .with_smoothing_epsilon(cfg.smoothing_epsilon())
+    .with_spill_options(spill.clone());
+    let discrete = reconstruct_grid(&recon_input)?;
+
+    let max_cluster_local = hc_slice
+      .iter()
+      .flat_map(|row| row.iter())
+      .copied()
+      .max()
+      .unwrap_or(-1);
+    let max_count_local = r.count().iter().copied().max().unwrap_or(0) as usize;
+    let num_clusters_local = if max_cluster_local < 0 {
+      // No assigned clusters → reconstruct returns a 1D
+      // `num_output_frames`-length zero vector (see
+      // `reconstruct::algo::reconstruct` early-out at
+      // `max_cluster < 0`). `discrete_to_spans` would then assert
+      // on `grid.len() == num_output_frames * num_clusters`, so
+      // skip the call entirely.
+      debug_assert_eq!(discrete.len(), r.count().len());
+      continue;
+    } else {
+      ((max_cluster_local + 1) as usize).max(max_count_local.max(1))
+    };
+
+    let local_spans: Vec<RttmSpan> = discrete_to_spans(
+      discrete.as_slice(),
+      r.count().len(),
+      num_clusters_local,
+      r.frames_sw(),
+      cfg.min_duration_off(),
+    );
+
+    for span in local_spans {
+      let start_off_samples = (span.start() * sr).max(0.0) as u64;
+      let dur_samples = (span.duration() * sr).max(0.0) as u64;
+      all_spans.push(DiarizedSpan::new(
+        r.abs_start_sample().saturating_add(start_off_samples),
+        r.abs_start_sample()
+          .saturating_add(start_off_samples)
+          .saturating_add(dur_samples),
+        span.cluster() as u32,
+      ));
+    }
+  }
+
+  // Sort by start time so callers can stream the output in order.
+  all_spans.sort_by_key(|s| s.start_sample());
+  // One-time `Vec`→`Arc<[T]>` copy at the boundary. `all_spans` is
+  // built by `Vec::push` because span count is unknown a-priori
+  // (it depends on per-range `discrete_to_spans` output); converting
+  // to `Arc<[DiarizedSpan]>` lets downstream consumers fan out
+  // cheaply via `Arc::clone`.
+  Ok(Arc::from(all_spans))
+}
+
+#[cfg(test)]
+mod refactor_tests {
+  use super::*;
+  use crate::{reconstruct::SlidingWindow, segment::FRAMES_PER_WINDOW};
+
+  const SLOTS: usize = 3;
+
+  /// `cluster_ranges_inner` on a single all-silent range returns Ok
+  /// with no spans (the `num_train < 2` pyannote fast path yields
+  /// hard_clusters all-zero, and an all-zero range reconstructs to no
+  /// emitted speakers). Proves the extracted helper is callable and the
+  /// carrier→OfflineInput wiring holds.
+  #[test]
+  fn cluster_ranges_inner_empty_range_is_ok_empty() {
+    let plda = PldaTransform::new().expect("plda");
+    let opts = StreamingOfflineOptions::new();
+    let num_chunks = 1;
+    let seg = vec![0.0_f64; num_chunks * FRAMES_PER_WINDOW * SLOTS];
+    let emb = vec![0.0_f32; num_chunks * SLOTS * EMBEDDING_DIM];
+    let chunk_dur = WINDOW_SAMPLES as f64 / SAMPLE_RATE_HZ as f64;
+    let chunks_sw = SlidingWindow::new(0.0, chunk_dur, 1.0);
+    let frames_sw = SlidingWindow::new(0.0, PYANNOTE_FRAME_DURATION_S, PYANNOTE_FRAME_STEP_S);
+    // The public `new` DERIVES the count from these (all-zero)
+    // segmentations — it no longer accepts a caller-supplied count — so
+    // the carrier carries the exact pyannote output-frame count (594 for
+    // one 10 s chunk at the community-1 frame step), all-zero, exercising
+    // the all-silent path with no chance of a forged count.
+    let range =
+      crate::streaming::RangeEmbeddings::new(0, num_chunks, seg, emb, chunks_sw, frames_sw)
+        .expect("carrier");
+    let spans = cluster_ranges_inner(&[range], &opts, &plda).expect("cluster ok");
+    assert_eq!(spans.len(), 0, "all-silent range yields no spans");
   }
 }
 
