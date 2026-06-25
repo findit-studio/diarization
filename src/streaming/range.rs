@@ -23,6 +23,13 @@ const SLOTS_PER_CHUNK: usize = 3;
 /// any threshold in `(0, 1]`; `0.5` is the canonical pyannote value and
 /// keeps the public-boundary derivation byte-identical to the count the
 /// internal path produces from the same hard segmentations.
+// Only `new` (the `pub(crate)` validating constructor) consumes this and
+// its sibling validation helpers, and `new`'s only callers are in-crate
+// tests. In a non-test build the cluster is therefore unreferenced; the
+// validation body is retained as defense-in-depth for those test callers
+// and any future in-crate caller, so suppress dead_code off the test cfg
+// rather than deleting it.
+#[cfg_attr(not(test), allow(dead_code))]
 const DERIVE_ONSET: f64 = 0.5;
 
 /// Shape-violation reasons for [`RangeEmbeddings::new`].
@@ -237,6 +244,7 @@ pub enum RangeShapeError {
 /// ignores it, because reconstruct's `center_offset = 0.5 *
 /// frames_sw.duration` does use it: a non-finite frame duration would
 /// drive `closest_frame` to a non-finite index downstream.
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_geometry(
   chunks_sw: SlidingWindow,
   frames_sw: SlidingWindow,
@@ -280,6 +288,7 @@ fn validate_geometry(
 /// boundary. This check also **subsumes** the finiteness check the count
 /// derivation would otherwise apply (NaN/±inf are not `0.0`/`1.0`), so it
 /// is the single segmentation-value gate.
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_segmentations_binary(segmentations: &[f64]) -> Result<(), RangeShapeError> {
   for (index, &got) in segmentations.iter().enumerate() {
     if got != 0.0 && got != 1.0 {
@@ -300,6 +309,7 @@ fn validate_segmentations_binary(segmentations: &[f64]) -> Result<(), RangeShape
 /// guarantee at the public boundary (see
 /// [`RangeShapeError::NonFiniteEmbeddings`] for why only finiteness, not
 /// the per-active-slot min-norm, is the carrier invariant).
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_embeddings_finite(raw_embeddings: &[f32]) -> Result<(), RangeShapeError> {
   for (index, &got) in raw_embeddings.iter().enumerate() {
     if !got.is_finite() {
@@ -340,6 +350,7 @@ fn validate_embeddings_finite(raw_embeddings: &[f32]) -> Result<(), RangeShapeEr
 /// contract requires hard-0/1 segmentations, the derived count is
 /// onset-independent and byte-identical to the count `build_range`
 /// produces from the same hard segmentations.
+#[cfg_attr(not(test), allow(dead_code))]
 fn derive_count(
   segmentations: &[f64],
   num_chunks: usize,
@@ -471,8 +482,15 @@ impl RangeEmbeddings {
   /// ([`NonFiniteEmbeddings`](RangeShapeError::NonFiniteEmbeddings)),
   /// or the count derivation's scratch allocation fails
   /// ([`CountDerivationFailed`](RangeShapeError::CountDerivationFailed)).
+  // `new` is the `pub(crate)` validating constructor; its only callers
+  // are in-crate tests (the public construction surface is
+  // `StreamingEmbedder::push` → `build_range` → `from_spill_parts`, which
+  // is valid by construction). Off the test cfg it is therefore unused —
+  // retained as defense-in-depth for the test callers and any future
+  // in-crate caller, so suppress dead_code rather than deleting it.
   #[allow(clippy::too_many_arguments)]
-  pub fn new(
+  #[cfg_attr(not(test), allow(dead_code))]
+  pub(crate) fn new(
     abs_start_sample: u64,
     num_chunks: usize,
     segmentations: Vec<f64>,
