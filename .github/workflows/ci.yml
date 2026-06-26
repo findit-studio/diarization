@@ -57,8 +57,9 @@ jobs:
       run: cargo install cargo-hack
     - name: Apply clippy lints
       # Exclude `tch` (libtorch env-dep) from the each-feature sweep —
-      # it has its own dedicated CI job. `silero-vad` IS swept now
-      # that `silero` is a registry dep. The per-EP features
+      # it has its own dedicated CI job. `silero-vad` is no longer a
+      # feature — `silero` moved to `[dev-dependencies]` (only the
+      # streaming example consumes it). The per-EP features
       # (`coreml`/`cuda`/`tensorrt`/...) and the `gpu` meta-feature
       # are also excluded: `each-feature` would build them
       # individually but `ort-sys 2.0.0-rc.12`'s prebuilt
@@ -285,7 +286,7 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links --cfg docsrs"
         run: |
           cargo doc --no-deps --features \
-            ort,bundled-segmentation,serde,silero-vad,coreml,cuda,tensorrt,directml,rocm,migraphx,openvino,webgpu,xnnpack,onednn,cann,acl,qnn,nnapi,tvm,azure
+            ort,bundled-segmentation,serde,coreml,cuda,tensorrt,directml,rocm,migraphx,openvino,webgpu,xnnpack,onednn,cann,acl,qnn,nnapi,tvm,azure
 
   # Compile check for the `tch` (TorchScript) backend. `tch` is not in
   # the cargo-hack feature sweeps below because it requires libtorch
@@ -501,6 +502,56 @@ jobs:
             aggregate::parity_tests \
             plda::parity_tests
 
+  # End-to-end pyannote-community-1 parity bench across all 14
+  # audio-fixtures clips. Runs the full dia pipeline (fbank → ResNet34
+  # embedding → AHC + VBx + centroid + Hungarian → reconstruct) and
+  # asserts spk + seg counts match the captured pyannote 4.0.4
+  # reference RTTM bit-for-bit. ~5–60 s per fixture under release
+  # builds; the whole sweep is ~25–30 min.
+  #
+  # Requires:
+  # - `audio-fixtures` repo (wavs + reference RTTMs), checked out at
+  #   `$GITHUB_WORKSPACE/audio-fixtures` and pointed to via
+  #   `DIA_AUDIO_FIXTURES`.
+  # - WeSpeaker ResNet34 ONNX model — fetched by
+  #   `scripts/download-embed-model.sh` (~26 MB).
+  # - `--ignored --test-threads=1` because each fixture loads ~50–60
+  #   MB of audio into memory and the test process holds intermediate
+  #   segmentation tensors; running them in parallel inflates peak RSS
+  #   past the runner's budget.
+  parity-bench:
+    name: parity bench (14 audio-fixtures clips)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check out audio-fixtures
+        uses: actions/checkout@v6
+        with:
+          repository: Findit-AI/audio-fixtures
+          path: audio-fixtures
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-parity-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-parity-bench-
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Download WeSpeaker embedding model
+        run: bash scripts/download-embed-model.sh
+      - name: Run end-to-end parity bench
+        env:
+          DIA_AUDIO_FIXTURES: ${{ github.workspace }}/audio-fixtures
+        run: |
+          cargo test --release \
+            --test parity_fixtures_endtoend \
+            --features ort,bundled-segmentation \
+            -- --ignored --test-threads=1 --nocapture
+
   sanitizer:
     name: sanitizer
     runs-on: ubuntu-latest
@@ -610,6 +661,7 @@ jobs:
       - avx2-sde
       - avx512-sde
       - neon-native
+      - parity-bench
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -631,10 +683,10 @@ jobs:
           RUSTFLAGS: "--cfg tarpaulin"
         # Explicit feature list instead of `--all-features`: the `tch`
         # backend needs libtorch on the runner (handled only by the
-        # dedicated `tch-compile-check` job). `silero-vad` is enabled
-        # below because the streaming example is documented as a
-        # supported quickstart and we want coverage to exercise it.
-        run: cargo tarpaulin --features ort,bundled-segmentation,serde,silero-vad,_bench --run-types tests --run-types doctests --workspace --out xml
+        # dedicated `tch-compile-check` job). `silero` is now a
+        # dev-dep (no `silero-vad` feature) — examples consume it
+        # directly under tarpaulin's test/example sweeps.
+        run: cargo tarpaulin --features ort,bundled-segmentation,serde,_bench --run-types tests --run-types doctests --workspace --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v6
         with:

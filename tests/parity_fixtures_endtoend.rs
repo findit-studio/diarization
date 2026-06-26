@@ -1,17 +1,23 @@
 //! End-to-end parity test: run the full dia pipeline on each
-//! `tests/parity/fixtures/*/clip_16k.wav` and assert the produced RTTM
-//! matches the captured pyannote 4.0.4 reference (`reference.rttm`)
-//! for both speaker count and segment count.
+//! audio-fixtures clip and assert the produced RTTM matches the
+//! captured pyannote 4.0.4 reference (`reference.rttm`) for both
+//! speaker count and segment count.
 //!
-//! Both fixtures (wav + reference rttm) are committed to the repo, so
-//! these tests run from a clean CI checkout without external
-//! provisioning.
+//! Audio fixtures + reference RTTMs live in the sister
+//! [`audio-fixtures`] repo. Resolved at test time via the
+//! `DIA_AUDIO_FIXTURES` env var (default: `../audio-fixtures` —
+//! co-located checkout). The dia-specific captured pyannote
+//! intermediates (`raw_embeddings.npz`, `segmentations.npz`, …)
+//! that 8 of the 14 fixtures need stay under
+//! `tests/parity/fixtures/<name>/` in dia's repo.
+//!
+//! [`audio-fixtures`]: https://github.com/Findit-AI/audio-fixtures
 //!
 //! `#[ignore]`-gated because they load the bundled segmentation +
 //! WeSpeaker ONNX models (the latter via
 //! `models/wespeaker_resnet34_lm.onnx`, which is not in-repo —
-//! `scripts/download-embed-model.sh` fetches it) and take ~5–60 s per
-//! fixture under release builds. Run explicitly:
+//! `scripts/download-embed-model.sh` fetches it) and take ~5–60 s
+//! per fixture under release builds. Run explicitly:
 //!
 //! ```
 //! cargo test --release --test parity_fixtures_endtoend \
@@ -34,8 +40,43 @@ use diarization::{
 };
 use std::{collections::BTreeSet, path::PathBuf};
 
-fn fixtures_dir() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/parity/fixtures")
+/// Resolves the `audio-fixtures` repo root.
+///
+/// Honors `DIA_AUDIO_FIXTURES` when set; otherwise defaults to
+/// `<crate-root>/../audio-fixtures` for a typical sibling-checkout
+/// developer layout (`findit-studio/dia` and
+/// `findit-studio/audio-fixtures`).
+fn audio_fixtures_root() -> PathBuf {
+  if let Some(env) = std::env::var_os("DIA_AUDIO_FIXTURES") {
+    return PathBuf::from(env);
+  }
+  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .parent()
+    .map(|p| p.join("audio-fixtures"))
+    .unwrap_or_else(|| PathBuf::from("../audio-fixtures"))
+}
+
+/// Locate the wav for a fixture name. The audio-fixtures layout
+/// groups wavs by codec (`pcm_s16le/<name>.wav`,
+/// `pcm_f32le/<name>.wav`, …); the same `<name>` is used as the
+/// stem. Tries `pcm_s16le` first (the bulk of the corpus) and falls
+/// back to `pcm_f32le` for clips that landed there (e.g.
+/// `01_dialogue` from the upstream pyannote-audio sample collection).
+fn fixture_wav_path(name: &str) -> Option<PathBuf> {
+  let root = audio_fixtures_root();
+  for codec in ["pcm_s16le", "pcm_f32le"] {
+    let p = root.join(codec).join(format!("{name}.wav"));
+    if p.exists() {
+      return Some(p);
+    }
+  }
+  None
+}
+
+fn fixture_reference_rttm(name: &str) -> PathBuf {
+  audio_fixtures_root()
+    .join("references")
+    .join(format!("{name}.rttm"))
 }
 
 fn load_wav(path: &PathBuf) -> Vec<f32> {
@@ -75,30 +116,46 @@ fn rttm_counts(path: &PathBuf) -> (usize, usize) {
   rttm_counts_str(&body)
 }
 
-/// Run dia on `<fixtures_dir>/<name>/clip_16k.wav` and assert
-/// `(speakers, segments)` matches `reference.rttm`. Each call freshly
-/// builds models + pipeline so per-test state is bounded.
+/// Run dia on the audio-fixtures clip for `name` and assert
+/// `(speakers, segments)` matches the captured pyannote 4.0.4
+/// reference. Each call freshly builds models + pipeline so per-test
+/// state is bounded.
 ///
-/// Skips with a clear `eprintln!` if the wav is absent (e.g. a
-/// shallow clone that hasn't pulled the wavs, or a contributor
-/// running tests before the fixtures land); CI must `panic!` since
-/// silently skipping a parity test in a release build defeats the
-/// point. Toggle via `DIA_REQUIRE_PARITY_FIXTURES=1` (or any
-/// non-empty `CI` env value).
+/// Skips with a clear `eprintln!` if the audio-fixtures repo isn't
+/// present (e.g. a contributor running tests without the sibling
+/// checkout); CI must `panic!` since silently skipping a parity test
+/// in a release build defeats the point. Toggle via
+/// `DIA_REQUIRE_PARITY_FIXTURES=1` (or any non-empty `CI` env value).
 fn assert_fixture_parity(name: &str) {
-  let fixture = fixtures_dir().join(name);
-  let wav = fixture.join("clip_16k.wav");
-  let reference = fixture.join("reference.rttm");
-  if !wav.exists() {
-    let require =
-      std::env::var_os("CI").is_some() || std::env::var_os("DIA_REQUIRE_PARITY_FIXTURES").is_some();
-    if require {
-      panic!("{} missing — track via plain git or LFS", wav.display());
+  let wav = match fixture_wav_path(name) {
+    Some(p) => p,
+    None => {
+      let require = std::env::var_os("CI").is_some()
+        || std::env::var_os("DIA_REQUIRE_PARITY_FIXTURES").is_some();
+      let root = audio_fixtures_root();
+      if require {
+        panic!(
+          "{name}.wav not found under {}/{{pcm_s16le,pcm_f32le}}/ — \
+           clone https://github.com/Findit-AI/audio-fixtures or set \
+           DIA_AUDIO_FIXTURES",
+          root.display()
+        );
+      }
+      eprintln!(
+        "[skip {name}] {name}.wav not found under {} — set \
+         DIA_AUDIO_FIXTURES or check out audio-fixtures as a sibling \
+         of dia",
+        root.display()
+      );
+      return;
     }
-    eprintln!("[skip {name}] {} not present", wav.display());
-    return;
-  }
-  assert!(reference.exists(), "missing {}", reference.display());
+  };
+  let reference = fixture_reference_rttm(name);
+  assert!(
+    reference.exists(),
+    "missing {} (audio-fixtures references/ should ship with the wav)",
+    reference.display()
+  );
 
   let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
   let emb_path: PathBuf = std::env::var_os("DIA_EMBED_MODEL_PATH")
@@ -139,23 +196,22 @@ fn assert_fixture_parity(name: &str) {
 macro_rules! fixture_parity_test {
   ($fn_name:ident, $fixture:literal) => {
     #[test]
-    #[ignore = "loads ONNX + wav (slow); run with --ignored"]
+    #[ignore = "loads ONNX + audio-fixtures wav (slow); run with --ignored"]
     fn $fn_name() {
       assert_fixture_parity($fixture);
     }
   };
 }
 
-// In-repo fixtures (6).
+// 14 audio-fixtures clips. `findit-ai/audio-fixtures` carries every
+// wav + reference rttm; layout is codec-keyed (`pcm_s16le/<name>.wav`,
+// `pcm_f32le/<name>.wav`) so the wav resolver above tries both.
 fixture_parity_test!(parity_01_dialogue, "01_dialogue");
 fixture_parity_test!(parity_02_pyannote_sample, "02_pyannote_sample");
 fixture_parity_test!(parity_03_dual_speaker, "03_dual_speaker");
 fixture_parity_test!(parity_04_three_speaker, "04_three_speaker");
 fixture_parity_test!(parity_05_four_speaker, "05_four_speaker");
 fixture_parity_test!(parity_06_long_recording, "06_long_recording");
-
-// testaudioset fixtures (8) — 08 / 10 already present, 07 / 09 / 11 /
-// 12 / 13 / 14 added with the `copy testaudioset wavs` change.
 fixture_parity_test!(
   parity_07_yuhewei_dongbei_english,
   "07_yuhewei_dongbei_english"

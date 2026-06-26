@@ -41,12 +41,14 @@ spikes/kaldi_fbank/python/uv.lock
 spikes/kaldi_fbank/rust.csv
 spikes/kaldi_fbank/python.csv
 
-# `tests/parity/fixtures/*/clip_16k.wav` was previously gitignored to
-# keep the repo lightweight, but the end-to-end parity test suite
-# (`tests/parity_fixtures_endtoend.rs`) and the docstring
-# parity-claim need every wav reproducible from a clean checkout. Now
-# tracked in plain git (~295 MB total across 14 fixtures, comparable
-# to existing `*.npz` capture artifacts).
+# Audio fixtures (`clip_16k.wav`) and reference RTTMs live in the
+# sister `audio-fixtures` repo (https://github.com/Findit-AI/audio-fixtures).
+# Tests resolve them at runtime via `DIA_AUDIO_FIXTURES` (env var,
+# default `../audio-fixtures` sibling). Only dia-specific captured
+# intermediates (`*.npz`, `*.npy`, `manifest.json`) live under
+# `tests/parity/fixtures/*/`.
+tests/parity/fixtures/*/clip_16k.wav
+tests/parity/fixtures/*/reference.rttm
 # verify_capture.py writes a backup before re-running.
 tests/parity/fixtures/.*.backup/
 

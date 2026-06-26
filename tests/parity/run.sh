@@ -15,22 +15,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$SCRIPT_DIR/../.."
 
-DEFAULT_CLIP="$SCRIPT_DIR/fixtures/01_dialogue/clip_16k.wav"
+# Audio fixtures live in the sister `audio-fixtures` repo
+# (https://github.com/Findit-AI/audio-fixtures). Pass an explicit path,
+# or set `DIA_AUDIO_FIXTURES` to point at a checkout — defaults to
+# `<dia>/../audio-fixtures` (sibling layout).
+AUDIO_FIXTURES="${DIA_AUDIO_FIXTURES:-$ROOT/../audio-fixtures}"
+DEFAULT_CLIP="$AUDIO_FIXTURES/pcm_f32le/01_dialogue.wav"
 CLIP="${1:-$DEFAULT_CLIP}"
-# `clip_16k.wav` files under `fixtures/*/` are gitignored (the upstream
-# reference clips are sourced separately and not tracked). On a clean
-# checkout the default path will not exist; surface a helpful error
-# instead of letting `realpath` fail under `set -e` with no context.
 if [ ! -f "$CLIP" ]; then
   if [ "$CLIP" = "$DEFAULT_CLIP" ]; then
     echo "[run.sh] error: default fixture clip not found at:" >&2
     echo "          $DEFAULT_CLIP" >&2
-    echo "        That path is gitignored on purpose (upstream-sourced" >&2
-    echo "        audio). Either:" >&2
-    echo "          - pass an explicit clip:  ./tests/parity/run.sh path/to/clip_16k.wav" >&2
-    echo "          - or provision the fixture by running" >&2
-    echo "            tests/parity/python/capture_intermediates.py" >&2
-    echo "            against your own 16 kHz mono WAV." >&2
+    echo "        Audio fixtures live in the sister 'audio-fixtures' repo." >&2
+    echo "        Either:" >&2
+    echo "          - check it out as a sibling of dia:" >&2
+    echo "            git clone https://github.com/Findit-AI/audio-fixtures.git $ROOT/../audio-fixtures" >&2
+    echo "          - or set DIA_AUDIO_FIXTURES to its location" >&2
+    echo "          - or pass an explicit clip:" >&2
+    echo "            ./tests/parity/run.sh path/to/clip_16k.wav" >&2
   else
     echo "[run.sh] error: clip not found: $CLIP" >&2
   fi

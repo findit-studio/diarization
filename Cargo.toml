@@ -216,21 +216,25 @@ optional = true
 anyhow = "1"
 criterion = "0.8"
 hound = "3"
-# Sister `silero` crate (VAD for streaming voice-range detection).
-# Only the `run_streaming_pipeline` example consumes it — the lib
-# itself never imports `silero`. Tracked as a dev-dependency rather
-# than an optional `[dependencies.silero] + silero-vad` feature pair
-# because (a) the lib has no code path through silero, (b)
-# downstream consumers never need it transitively, (c) examples have
-# access to dev-dependencies, so keeping it here both lightens the
-# public dependency graph and the feature surface.
-silero = "0.4"
 # `diarization::plda` parity tests load captured `.npz` artifacts.
 # Production code embeds the PLDA weights via `include_bytes!` and
 # does not depend on npyz.
 npyz = { version = "0.9", features = ["npz"] }
 # Used by the `serde` feature's roundtrip tests.
 serde_json = "1"
+
+# Sister `silero` crate (VAD for streaming voice-range detection).
+# Only the `run_streaming_pipeline` example consumes it — the lib
+# itself never imports `silero`. Target-gated to the same arch set
+# `ort` supports because `silero` transitively depends on `ort-sys`,
+# which has no prebuilt binaries for powerpc64 / riscv64 / s390x /
+# i686 / wasm. Cross-builds + Miri jobs that target those arches
+# would otherwise fail to compile silero's transitive ort. This
+# matches the example's `required-features = ["ort", ...]` —
+# silero is irrelevant on archs where the example wouldn't build
+# anyway.
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dev-dependencies]
+silero = "0.4"
 
 [[example]]
 path = "examples/run_owned_pipeline.rs"

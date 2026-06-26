@@ -15,10 +15,36 @@ use diarization::{
 };
 use std::{fs::File, io::BufReader, path::PathBuf};
 
+/// Captured pyannote intermediates (`segmentations.npz`,
+/// `raw_embeddings.npz`, …) live under `tests/parity/fixtures/<name>/`
+/// in dia's repo. Audio + reference RTTM live in the sister
+/// `audio-fixtures` repo (resolved via `DIA_AUDIO_FIXTURES` or
+/// `../audio-fixtures` sibling default).
 fn fixture_dir() -> PathBuf {
   let f =
     std::env::var("DIA_DRIFT_FIXTURE").unwrap_or_else(|_| "10_mrbeast_clean_water".to_string());
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/parity/fixtures/{f}"))
+}
+
+fn audio_fixtures_root() -> PathBuf {
+  if let Some(env) = std::env::var_os("DIA_AUDIO_FIXTURES") {
+    return PathBuf::from(env);
+  }
+  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .parent()
+    .map(|p| p.join("audio-fixtures"))
+    .unwrap_or_else(|| PathBuf::from("../audio-fixtures"))
+}
+
+fn fixture_wav_path(name: &str) -> Option<PathBuf> {
+  let root = audio_fixtures_root();
+  for codec in ["pcm_s16le", "pcm_f32le"] {
+    let p = root.join(codec).join(format!("{name}.wav"));
+    if p.exists() {
+      return Some(p);
+    }
+  }
+  None
 }
 
 fn load_wav(path: &PathBuf) -> Vec<f32> {
@@ -50,14 +76,21 @@ fn read_npz_f32(path: &PathBuf, key: &str) -> (Vec<f32>, Vec<u64>) {
 }
 
 #[test]
-#[ignore = "loads clip_16k.wav, requires audio + ONNX models"]
+#[ignore = "loads audio-fixtures wav, requires audio + ONNX models"]
 fn measure_segmentation_drift_10() {
   let dir = fixture_dir();
-  let wav_path = dir.join("clip_16k.wav");
-  if !wav_path.exists() {
-    eprintln!("skip: {} not present", wav_path.display());
-    return;
-  }
+  let fixture_name = std::env::var("DIA_DRIFT_FIXTURE")
+    .unwrap_or_else(|_| "10_mrbeast_clean_water".to_string());
+  let wav_path = match fixture_wav_path(&fixture_name) {
+    Some(p) => p,
+    None => {
+      eprintln!(
+        "skip: {fixture_name}.wav not under {} — set DIA_AUDIO_FIXTURES",
+        audio_fixtures_root().display()
+      );
+      return;
+    }
+  };
   let samples = load_wav(&wav_path);
   let (py_seg, py_shape) = read_npz_f32(&dir.join("segmentations.npz"), "segmentations");
   let py_chunks = py_shape[0] as usize;
@@ -138,14 +171,21 @@ fn measure_segmentation_drift_10() {
 }
 
 #[test]
-#[ignore = "loads clip_16k.wav, requires audio + ONNX models"]
+#[ignore = "loads audio-fixtures wav, requires audio + ONNX models"]
 fn measure_embedding_drift_10() {
   let dir = fixture_dir();
-  let wav_path = dir.join("clip_16k.wav");
-  if !wav_path.exists() {
-    eprintln!("skip: {} not present", wav_path.display());
-    return;
-  }
+  let fixture_name = std::env::var("DIA_DRIFT_FIXTURE")
+    .unwrap_or_else(|_| "10_mrbeast_clean_water".to_string());
+  let wav_path = match fixture_wav_path(&fixture_name) {
+    Some(p) => p,
+    None => {
+      eprintln!(
+        "skip: {fixture_name}.wav not under {} — set DIA_AUDIO_FIXTURES",
+        audio_fixtures_root().display()
+      );
+      return;
+    }
+  };
   let emb_path: PathBuf = std::env::var_os("DIA_EMBED_MODEL_PATH")
     .map(PathBuf::from)
     .unwrap_or_else(|| {

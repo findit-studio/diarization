@@ -14,6 +14,21 @@ fn fixture(rel: &str) -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
+/// Reference RTTMs live in the sister `audio-fixtures` repo
+/// (`references/<name>.rttm`). Resolved via `DIA_AUDIO_FIXTURES` env
+/// var or the `../audio-fixtures` sibling default.
+fn audio_fixtures_reference(fixture_name: &str) -> PathBuf {
+  let root = std::env::var_os("DIA_AUDIO_FIXTURES")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| {
+      PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("audio-fixtures"))
+        .unwrap_or_else(|| PathBuf::from("../audio-fixtures"))
+    });
+  root.join("references").join(format!("{fixture_name}.rttm"))
+}
+
 fn read_npz_array<T: npyz::Deserialize>(path: &PathBuf, key: &str) -> (Vec<T>, Vec<u64>) {
   let f = File::open(path).expect("open npz");
   let mut z = NpzArchive::new(BufReader::new(f)).expect("read npz");
@@ -85,8 +100,11 @@ fn run_offline_parity(fixture_dir: &str) {
 
   let out = diarize_offline(&input).expect("diarize_offline");
 
-  // Compare RTTM line count + format to captured reference.
-  let ref_path = fixture(&format!("{base}/reference.rttm"));
+  // Compare RTTM line count + format to captured reference. Lives
+  // in the sister `audio-fixtures` repo, not in `base` — the
+  // captured pyannote intermediates (npz/npy) stay local but the
+  // reference RTTMs are shared with the `dia` family of consumers.
+  let ref_path = audio_fixtures_reference(fixture_dir);
   let ref_text = std::fs::read_to_string(&ref_path).expect("read reference.rttm");
   let ref_lines: Vec<&str> = ref_text
     .lines()

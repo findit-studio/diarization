@@ -21,6 +21,21 @@ fn fixture(rel: &str) -> PathBuf {
   repo_root().join(rel)
 }
 
+/// Reference RTTMs live in the sister `audio-fixtures` repo
+/// (`references/<name>.rttm`). Resolved via `DIA_AUDIO_FIXTURES` env
+/// var or the `../audio-fixtures` sibling default.
+fn audio_fixtures_reference(fixture_name: &str) -> PathBuf {
+  let root = std::env::var_os("DIA_AUDIO_FIXTURES")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| {
+      repo_root()
+        .parent()
+        .map(|p| p.join("audio-fixtures"))
+        .unwrap_or_else(|| PathBuf::from("../audio-fixtures"))
+    });
+  root.join("references").join(format!("{fixture_name}.rttm"))
+}
+
 fn read_npz_array<T>(path: &PathBuf, key: &str) -> (Vec<T>, Vec<u64>)
 where
   T: npyz::Deserialize,
@@ -173,7 +188,10 @@ fn run_rttm_parity(fixture_dir: &str, uri: &str) {
   let lines = spans_to_rttm_lines(&spans, uri);
 
   // ── Compare to reference.rttm ─────────────────────────────────────
-  let ref_path = fixture(&format!("{base}/reference.rttm"));
+  // Lives in the sister `audio-fixtures` repo (`references/`), not
+  // in `base` — the captured pyannote intermediates (npz/npy) stay
+  // local but reference RTTMs are shared across the `dia` family.
+  let ref_path = audio_fixtures_reference(fixture_dir);
   let ref_text = std::fs::read_to_string(&ref_path).expect("read reference.rttm");
   let ref_lines: Vec<&str> = ref_text.lines().filter(|l| !l.is_empty()).collect();
 
