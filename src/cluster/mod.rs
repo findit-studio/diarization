@@ -1,6 +1,6 @@
-//! Speaker clustering — generic offline batch [`cluster_offline`] plus
-//! the pyannote `cluster_vbx`-pipeline primitives ([`ahc`], [`vbx`],
-//! [`centroid`], [`hungarian`]).
+//! Speaker clustering — generic offline batch [`cluster_offline`], the
+//! pyannote `cluster_vbx`-pipeline primitives ([`ahc`], [`vbx`],
+//! [`centroid`], [`hungarian`]), and a streaming [`online`] engine.
 //!
 //! # Generic offline path
 //! [`cluster_offline`] takes a slice of embeddings and returns a
@@ -17,10 +17,17 @@
 //! [`crate::pipeline::assign_embeddings`] and
 //! [`crate::offline::diarize_offline`]. Direct use is uncommon — the
 //! pipeline / offline entrypoints are the supported API surface.
+//!
+//! # Online (streaming) engine
+//! [`online`] is a separate algorithm class — FluidAudio's greedy
+//! centroid matcher (assign-as-you-go, order-dependent, cosine on raw
+//! embeddings, no PLDA). It is NOT pyannote-parity and is gated against a
+//! FluidAudio Swift oracle rather than DER; see its module doc.
 
 pub mod ahc;
 pub mod centroid;
 pub mod hungarian;
+pub mod online;
 pub mod vbx;
 
 mod error;
@@ -61,4 +68,7 @@ const _: fn() = || {
   assert_send_sync::<centroid::Error>();
   assert_send_sync::<vbx::VbxOutput>();
   assert_send_sync::<vbx::StopReason>();
+  assert_send_sync::<online::OnlineClusterer>();
+  assert_send_sync::<online::OnlineClusterOptions>();
+  assert_send_sync::<online::Assignment>();
 };
