@@ -29,7 +29,7 @@ const EMBEDDING_UPDATE_MIN_SUMSQ: f32 = 0.01;
 
 /// Clamp epsilon in FluidAudio's `l2Normalize`: the norm is floored at this
 /// value rather than the vector being rejected
-/// (`Offline/Utils/VDSPOperations.swift:9,18`). Distinct from dia's
+/// (`Offline/Utils/VDSPOperations.swift:10,17`). Distinct from dia's
 /// [`Embedding::normalize_from`], which *rejects* below `NORM_EPSILON`; the
 /// centroid intermediates here are not [`Embedding`]s, so the faithful clamp
 /// applies.
@@ -174,13 +174,34 @@ impl OnlineClusterer {
   /// Faithful port of `SpeakerManager.assignSpeaker`
   /// (`Clustering/SpeakerManager.swift:135-177`):
   ///
-  /// 1. `embedding` is already the L2-normalized vector FluidAudio would
-  ///    produce at `:147` — dia's [`Embedding`] invariant is exactly the
-  ///    `l2Normalize` output. (The one divergence: a degenerate raw vector
-  ///    becomes `None` at [`Embedding::normalize_from`] and never reaches
-  ///    here, where FluidAudio would clamp it via `l2Normalize` and reject it
-  ///    later at the `sumSquares > 0.01` guard — same net effect, moved
-  ///    upstream.)
+  /// 1. `embedding` is the caller's L2-normalized vector, standing in for the
+  ///    `l2Normalize(rawEmbedding)` FluidAudio computes at `:147`. Two
+  ///    faithfulness caveats apply, both deliberate:
+  ///    - **Normalization is not bit-identical to Accelerate.** dia's
+  ///      [`Embedding`] comes from [`Embedding::normalize_from`] (sum of
+  ///      squares in `f64`, then a per-component divide); FluidAudio's
+  ///      `l2Normalize` sums in `f32` via `vDSP_dotpr` and multiplies by the
+  ///      reciprocal. They agree to ~1 ULP but not to the bit, and vDSP's SIMD
+  ///      reduction order is *not* reproducible in scalar `f32` at all — even
+  ///      the exact scalar `l2Normalize` op-sequence still differs from Swift's
+  ///      committed vDSP trace by ≈3.4e-8 (~1 ULP). A cosine distance sitting
+  ///      exactly on `speaker_threshold` can therefore have its strict-`<`
+  ///      outcome differ from Accelerate by that last ULP. This is a bound of
+  ///      the scalar port, not a bug: re-normalizing here does not close it (it
+  ///      only injects more scalar-vs-vDSP noise — measured against the oracle
+  ///      trace), so the arithmetic is left as the faithful op-mirror it
+  ///      already is.
+  ///    - **Degenerate vectors are excluded by domain, not rejected the Swift
+  ///      way.** An [`Embedding`] exists only for `||raw|| > NORM_EPSILON`, so a
+  ///      zero/degenerate raw never reaches `assign`. FluidAudio does *not*
+  ///      reject it: `l2Normalize` floors the norm at `1e-12`, so a zero vector
+  ///      normalizes to all-zeros and STILL creates a speaker (with a zero
+  ///      centroid — only its history entry is dropped by the `sumSquares >
+  ///      0.01` guard), and a sub-`1e-12` vector is *amplified* (e.g.
+  ///      `[5e-13, …] → [0.5, …]`) and seeds a speaker with that amplified
+  ///      centroid. dia's typed API forbids those states rather than
+  ///      reproducing them; this is a restriction of the port's input domain,
+  ///      not equivalent behavior.
   /// 2. Find the nearest existing centroid by cosine distance, strict-min
   ///    (`:417-430`). Ties break to the LOWEST id: speakers are scanned in
   ///    ascending-id order and the strict `<` keeps the first of an equal
@@ -295,7 +316,12 @@ impl OnlineSpeaker {
   /// The redundant `sumSquares > 0.01` guard at `:75-77` is applied by the
   /// caller before this runs; it is not re-checked here.
   fn update_main_embedding(&mut self, e: &[f32; EMBEDDING_DIM], duration: f32) {
-    // 1. FIFO append (SpeakerTypes.swift:111-115).
+    // 1. FIFO append (SpeakerTypes.swift:111-115). FluidAudio re-normalizes on
+    //    the way in (RawEmbedding.init -> l2Normalize, SpeakerTypes.swift:215);
+    //    dia stores `*e` directly. That renorm is redundant here -- `e` is an
+    //    Embedding, already unit-norm by construction -- and re-adding it only
+    //    widens the scalar-vs-vDSP gap against Swift's oracle trace (measured),
+    //    so it is deliberately omitted.
     if self.raw_history.len() >= RAW_HISTORY_CAP {
       self.raw_history.remove(0);
     }
