@@ -269,6 +269,32 @@ fn many_identical_updates_stay_one_speaker() {
   );
 }
 
+#[test]
+fn fifo_cap_evicts_oldest_at_fifty() {
+  // Pin the FIFO-50 rule precisely (SpeakerTypes.swift:111-115). The prior
+  // test feeds 60 IDENTICAL vectors, so the mean is basis0 no matter what the
+  // cap does — it cannot see an eviction bug. Here we seed spk1 with basis(1),
+  // then feed 50 × basis(0) into the SAME speaker (wide thresholds so every
+  // basis(0) both matches and updates spk1). The 50th append finds the history
+  // already at the cap and must evict the OLDEST entry — the lone basis(1) —
+  // leaving history = [basis(0); 50], whose mean (hence centroid) is EXACTLY
+  // basis(0).
+  //
+  // Mutation-proofs (each turns this red):
+  //   • cap 50→51, or the off-by-one `>=`→`>`: basis(1) survives the 50th
+  //     append, so centroid ≈ [0.99984, 0.01800, …] ≠ basis(0).
+  //   • wrong-end eviction (remove newest): basis(1) is never evicted → same
+  //     residue → centroid ≠ basis(0).
+  let mut c = OnlineClusterer::new(opts(1.5, 1.5, 0.0));
+  assert_eq!(c.assign(&basis(1), 1.0), Assignment::New(1));
+  for _ in 0..50 {
+    assert_eq!(c.assign(&basis(0), 1.0), Assignment::Existing(1));
+  }
+  assert_eq!(c.speaker_count(), 1);
+  // Exactly basis(0): the basis(1) seed has been evicted from the FIFO.
+  assert_eq!(c.centroid(1).unwrap(), basis(0).as_array());
+}
+
 // ── State management ─────────────────────────────────────────────────────
 
 #[test]
@@ -337,11 +363,64 @@ fn l2_normalize_hand_values() {
   assert!((u[0] - 1.0).abs() < 1e-6);
 
   // Zero vector is CLAMPED, not rejected: norm floored at 1e-12, result all
-  // zero, no NaN (VDSPOperations.swift:18 — distinct from normalize_from).
+  // zero, no NaN (VDSPOperations.swift:17 — distinct from normalize_from).
   let z = l2_normalize(&[0.0f32; EMBEDDING_DIM]);
   assert!(
     z.iter().all(|x| *x == 0.0),
     "clamped zero vector must stay zero, got {:?}",
     &z[..2]
   );
+}
+
+#[test]
+fn cosine_distance_unit_fast_path_is_not_the_divide_path() {
+  // Distinguish the unit fast path (similarity = raw dot) from the
+  // always-divide branch (SpeakerOperations.swift:81-96). `a` has
+  // sum-of-squares 1.0000960 — inside UNIT_TOLERANCE (1e-3) of 1 — so both
+  // inputs are treated as unit and the similarity IS the dot product, 0.9,
+  // giving distance 0.1. The divide branch would scale by 1/‖a‖ and land at
+  // 0.1000432 instead. The fast-path result is within 1 ULP of 0.1; the divide
+  // result is ~4.3e-5 away, so `< 1e-6` separates them.
+  //
+  // Mutation-proof: delete the `is_unit_a && is_unit_b` fast path (always
+  // divide) → distance 0.1000432, |·−0.1| ≈ 4.3e-5 > 1e-6 → red.
+  let a = raw2(0.9, 0.436); // ‖a‖² = 1.0000960, inside the fast-path window
+  let b0 = *basis(0).as_array();
+  let d = cosine_distance(&a, &b0);
+  assert!((d - 0.1).abs() < 1e-6, "fast-path distance = {d}");
+}
+
+#[test]
+fn cosine_distance_clamps_overshooting_dot_to_zero() {
+  // emb2(2,3) normalizes to a vector whose f32 self-sum-of-squares rounds to
+  // 1.0000001 (> 1.0). On the unit fast path the self-"similarity" is that
+  // dot — 1.0000001 — which OVERSHOOTS 1.0; the clamp to [-1, 1]
+  // (SpeakerOperations.swift:99) pins it at 1.0, so the self-distance is
+  // exactly 0.0.
+  //
+  // Mutation-proof: drop the `.clamp(-1.0, 1.0)` → similarity 1.0000001,
+  // distance 1 − 1.0000001 = −1.19e-7, a NEGATIVE distance ≠ 0.0 → red.
+  let e = *emb2(2.0, 3.0).as_array();
+  assert_eq!(cosine_distance(&e, &e), 0.0);
+}
+
+#[test]
+fn l2_normalize_epsilon_clamp_is_1e_minus_12() {
+  // Pin the norm floor in l2_normalize at exactly 1e-12
+  // (VDSPOperations.swift:10,17). For v = [5e-13, 0, …] the true norm 5e-13 is
+  // BELOW the floor, so the norm is clamped to 1e-12 and the scale is
+  // 1/1e-12 = 1e12, mapping the single component to 5e-13 · 1e12 = 0.5 exactly.
+  //
+  // Mutation-proofs:
+  //   • drop the `.max(L2_NORM_EPSILON)` clamp → scale by 1/5e-13, component
+  //     → 1.0 ≠ 0.5 → red.
+  //   • change the epsilon (e.g. 1e-13 < 5e-13) → the clamp never fires, scale
+  //     by 1/5e-13, component → 1.0 ≠ 0.5 → red.
+  // Such a vector can never arrive as an `Embedding` (normalize_from rejects
+  // ‖·‖ < NORM_EPSILON); this pins the clamp on the intermediate centroids.
+  let mut v = [0.0f32; EMBEDDING_DIM];
+  v[0] = 5e-13;
+  let out = l2_normalize(&v);
+  assert_eq!(out[0], 0.5);
+  assert!(out[1..].iter().all(|&x| x == 0.0));
 }
