@@ -18,8 +18,8 @@ rust-version = "1.95"
 # carries the CC-BY-4.0 PLDA and the BSD/Apache port attributions). See this
 # crate's `NOTICE` and `models/SOURCE.md`.
 license = "(MIT OR Apache-2.0) AND MIT"
-repository = "https://github.com/al8n/diarization"
-homepage = "https://github.com/al8n/diarization"
+repository = "https://github.com/findit-studio/diarization"
+homepage = "https://github.com/findit-studio/diarization"
 documentation = "https://docs.rs/diarization"
 description = "Sans-I/O speaker diarization for streaming audio. Bundles the pyannote/segmentation-3.0 model and sources the speaker-diarization-community-1 PLDA weights from its diaric dependency — only the WeSpeaker embedding ONNX is BYO."
 readme = "README.md"
