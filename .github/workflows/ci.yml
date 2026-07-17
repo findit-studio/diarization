@@ -428,7 +428,7 @@ jobs:
         # dedicated `tch-compile-check` job).
         run: cargo tarpaulin --features ort,bundled-segmentation,serde --run-types tests --run-types doctests --workspace --out xml
       - name: Upload to codecov.io
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: ${{ github.repository }}
