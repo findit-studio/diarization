@@ -147,11 +147,11 @@ gpu = [
 # primitive). Everything ort/tch-free that this crate used to define now
 # lives in `diaric` and is re-exported from `lib.rs`.
 #
-# Rev-pinned to the `feat/import-core` HEAD (fresh-clone resolution, day
-# one — a clean `diarization` clone with no sibling checkout must resolve).
-# T3 re-pins this to the diaric MERGE sha once the owner merges the diaric
-# PR.
-diaric = { git = "https://github.com/findit-studio/diaric", rev = "877189e434aff080c1340313caf8801cea946af3" }
+# Rev-pinned to the diaric `main` merge commit for diaric #1 (fresh-clone
+# resolution — a clean `diarization` clone with no sibling checkout must
+# resolve). T3 re-pin: bumped from the `feat/import-core` branch HEAD to
+# this merge-reachable `main` HEAD now that diaric #1 has merged.
+diaric = { git = "https://github.com/findit-studio/diaric", rev = "747abbc263f5e9380ab77bc6fe65995df3d98364" }
 
 thiserror = "2"
 ort = { version = "2.0.0-rc.12", optional = true }
