@@ -245,7 +245,7 @@ impl OnlineClusterer {
   ///      trace), so the arithmetic is left as the faithful op-mirror it
   ///      already is.
   ///    - **Degenerate vectors are excluded by domain, not rejected the Swift
-  ///      way.** An [`Embedding`] exists only for `||raw|| > NORM_EPSILON`, so a
+  ///      way.** An [`Embedding`] exists only for `||raw|| >= NORM_EPSILON`, so a
   ///      zero/degenerate raw never reaches `assign`. FluidAudio does *not*
   ///      reject it: `l2Normalize` floors the norm at `1e-12`, so a zero vector
   ///      normalizes to all-zeros and STILL creates a speaker (with a zero
@@ -415,8 +415,12 @@ pub(crate) fn sum_squares(v: &[f32; EMBEDDING_DIM]) -> f32 {
 
 /// L2-normalize with FluidAudio's *clamp* semantics
 /// (`Offline/Utils/VDSPOperations.swift:12-23`): the norm is floored at
-/// [`L2_NORM_EPSILON`] and the vector is scaled by its reciprocal — a
-/// zero/near-zero vector is returned ~unchanged rather than rejected.
+/// [`L2_NORM_EPSILON`] (`1e-12`) and the vector is scaled by its reciprocal,
+/// rather than the vector being rejected. At the floor the two degenerate
+/// cases diverge, mirroring Swift: a true zero vector stays zero
+/// (`0 · 1e12 = 0`), but a nonzero vector whose norm is below the floor is
+/// *amplified* by `1 / 1e-12` — e.g. `[5e-13, …] → [0.5, …]` — NOT returned
+/// unchanged.
 pub(crate) fn l2_normalize(v: &[f32; EMBEDDING_DIM]) -> [f32; EMBEDDING_DIM] {
   let norm = sum_squares(v).sqrt().max(L2_NORM_EPSILON);
   let scale = 1.0 / norm;
