@@ -42,6 +42,7 @@ jobs:
   clippy:
     name: clippy
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -57,8 +58,7 @@ jobs:
       run: cargo install cargo-hack
     - name: Apply clippy lints
       # Exclude `tch` (libtorch env-dep) from the each-feature sweep —
-      # it has its own dedicated CI job. `silero-vad` IS swept now
-      # that `silero` is a registry dep. The per-EP features
+      # it has its own dedicated CI job. The per-EP features
       # (`coreml`/`cuda`/`tensorrt`/...) and the `gpu` meta-feature
       # are also excluded: `each-feature` would build them
       # individually but `ort-sys 2.0.0-rc.12`'s prebuilt
@@ -80,6 +80,7 @@ jobs:
   cross:
     name: cross (scalar, --no-default-features)
     strategy:
+      fail-fast: false
       matrix:
         # `wasm32-unknown-unknown` is intentionally excluded here:
         # the transitive `getrandom 0.2` dep emits a `compile_error!`
@@ -141,6 +142,7 @@ jobs:
   cross-ort:
     name: cross (ort + bundled-segmentation)
     strategy:
+      fail-fast: false
       matrix:
         # Targets where `ort-sys 2.0.0-rc.12` ships a prebuilt
         # archive via `download-binaries`. Windows MSVC is covered
@@ -285,7 +287,7 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links --cfg docsrs"
         run: |
           cargo doc --no-deps --features \
-            ort,bundled-segmentation,serde,silero-vad,coreml,cuda,tensorrt,directml,rocm,migraphx,openvino,webgpu,xnnpack,onednn,cann,acl,qnn,nnapi,tvm,azure
+            ort,bundled-segmentation,serde,coreml,cuda,tensorrt,directml,rocm,migraphx,openvino,webgpu,xnnpack,onednn,cann,acl,qnn,nnapi,tvm,azure
 
   # Compile check for the `tch` (TorchScript) backend. `tch` is not in
   # the cargo-hack feature sweeps below because it requires libtorch
@@ -318,13 +320,14 @@ jobs:
         # separate libtorch tarball download.
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python3 -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.11.*"
       - name: cargo check --no-default-features --features tch
         run: cargo check --lib --no-default-features --features tch
 
   build:
     name: build
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -361,6 +364,7 @@ jobs:
   test:
     name: test
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -421,10 +425,8 @@ jobs:
           RUSTFLAGS: "--cfg tarpaulin"
         # Explicit feature list instead of `--all-features`: the `tch`
         # backend needs libtorch on the runner (handled only by the
-        # dedicated `tch-compile-check` job). `silero-vad` is enabled
-        # below because the streaming example is documented as a
-        # supported quickstart and we want coverage to exercise it.
-        run: cargo tarpaulin --features ort,bundled-segmentation,serde,silero-vad,_bench --run-types tests --run-types doctests --workspace --out xml
+        # dedicated `tch-compile-check` job).
+        run: cargo tarpaulin --features ort,bundled-segmentation,serde --run-types tests --run-types doctests --workspace --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v6
         with:
