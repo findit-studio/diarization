@@ -19,8 +19,9 @@ Sans-I/O speaker diarization with pyannote-equivalent accuracy.
 
 ## Quick start
 
-The segmentation model and PLDA weights ship inside the crate — only the
-WeSpeaker ResNet34-LM embedding ONNX is BYO (~26 MB; above the
+The segmentation model ships inside this crate, and the PLDA weights ship
+inside its `diaric` dependency — both embed into your binary automatically,
+so only the WeSpeaker ResNet34-LM embedding ONNX is BYO (~26 MB; above the
 crates.io 10 MB hard limit, so it cannot be bundled). Fetch it from the
 [FinDIT-Studio/dia-models](https://huggingface.co/FinDIT-Studio/dia-models)
 HuggingFace bundle. Both commands below pin a specific HF commit and
@@ -99,16 +100,19 @@ location if you keep the model elsewhere.
 `silero` is tracked as a dev-dependency (only `examples/run_streaming_pipeline.rs`
 consumes it). No feature gate — examples have access to dev-deps.
 
-The PLDA parity test runs as part of the regular test suite — no
-feature flag required:
+The PLDA parity suite moved to the `diaric` dependency along with the
+backend-free core; it lives in `diaric`'s `src/plda/parity_tests.rs`.
+Cargo does not import a dependency's unit tests through re-exports, so the
+filter matches 0 tests here — run it from a `diaric` checkout instead:
 
 ```bash
+# from a checkout of https://github.com/findit-studio/diaric
 cargo test plda::parity_tests
 ```
 
 It auto-skips when `tests/parity/fixtures/01_dialogue/*.npz` is absent
-(checked-in for this repo, but a fresh checkout from a model-only
-mirror would have to regenerate them via the Phase-0 capture script).
+(checked in to `diaric`, but a fresh checkout from a model-only mirror
+would have to regenerate them via the Phase-0 capture script).
 
 ## License
 

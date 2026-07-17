@@ -21,12 +21,13 @@ license = "(MIT OR Apache-2.0) AND MIT"
 repository = "https://github.com/al8n/diarization"
 homepage = "https://github.com/al8n/diarization"
 documentation = "https://docs.rs/diarization"
-description = "Sans-I/O speaker diarization for streaming audio. Bundles the pyannote/segmentation-3.0 model and the speaker-diarization-community-1 PLDA weights — only the WeSpeaker embedding ONNX is BYO."
+description = "Sans-I/O speaker diarization for streaming audio. Bundles the pyannote/segmentation-3.0 model and sources the speaker-diarization-community-1 PLDA weights from its diaric dependency — only the WeSpeaker embedding ONNX is BYO."
 readme = "README.md"
 # Keep `cargo package` lean. crates.io's hard limit is 10 MB
-# compressed; we ship the bundled segmentation model (~6 MB) and
-# PLDA `.bin` blobs (~530 KB) which are loaded via `include_bytes!`
-# at runtime, but everything else dev-only is excluded.
+# compressed; we ship the bundled segmentation model (~6 MB), loaded
+# via `include_bytes!` at runtime, but everything else dev-only is
+# excluded. (The PLDA `.bin` blobs now ship inside the `diaric`
+# dependency, not this crate.)
 #
 # Verify with `cargo package --list --allow-dirty` and
 # `ls -lh /Users/user/.cargo/target/package/diarization-*.crate`.
@@ -211,8 +212,8 @@ required-features = ["ort", "bundled-segmentation"]
 
 [package.metadata.docs.rs]
 # Pin the docs.rs feature set explicitly. `all-features = true`
-# would enable `tch` (needs LIBTORCH on the build host) and the
-# `_bench` internal feature — neither of which docs.rs provides.
+# would enable `tch`, which needs LIBTORCH on the build host —
+# something docs.rs does not provide.
 # The list below covers the full public API surface: default
 # (`ort` + `bundled-segmentation`), optional `serde`, and EVERY per-EP
 # feature so that every `dia::ep::*` re-export and `#[doc(cfg(...))]`
