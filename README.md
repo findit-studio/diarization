@@ -20,9 +20,10 @@ Sans-I/O speaker diarization with pyannote-equivalent accuracy.
 ## Quick start
 
 The segmentation model ships inside this crate, and the PLDA weights ship
-inside its `diaric` dependency — both embed into your binary automatically,
-so only the WeSpeaker ResNet34-LM embedding ONNX is BYO (~26 MB; above the
-crates.io 10 MB hard limit, so it cannot be bundled). Fetch it from the
+inside its [`diaric`](https://crates.io/crates/diaric) dependency (a published
+crate) — both embed into your binary automatically, so only the WeSpeaker
+ResNet34-LM embedding ONNX is BYO (~26 MB; above the crates.io 10 MB hard
+limit, so it cannot be bundled). Fetch it from the
 [FinDIT-Studio/dia-models](https://huggingface.co/FinDIT-Studio/dia-models)
 HuggingFace bundle. Both commands below pin a specific HF commit and
 verify SHA-256 before installing — a republished or truncated upstream
@@ -100,10 +101,14 @@ location if you keep the model elsewhere.
 `silero` is tracked as a dev-dependency (only `examples/run_streaming_pipeline.rs`
 consumes it). No feature gate — examples have access to dev-deps.
 
-The PLDA parity suite moved to the `diaric` dependency along with the
-backend-free core; it lives in `diaric`'s `src/plda/parity_tests.rs`.
-Cargo does not import a dependency's unit tests through re-exports, so the
-filter matches 0 tests here — run it from a `diaric` checkout instead:
+The PLDA parity suite moved to the [`diaric`](https://crates.io/crates/diaric)
+dependency along with the backend-free core; it lives in `diaric`'s
+`src/plda/parity_tests.rs` (API docs at [docs.rs/diaric](https://docs.rs/diaric)).
+`diaric` is a published crate, but running its parity suite still needs a source
+checkout: Cargo does not run a dependency's unit tests through re-exports (so the
+filter matches 0 tests here), and the `.npz` fixtures those tests read are
+checked into the `diaric` repo rather than shipped in the published crate tarball
+(they would blow the crates.io 10 MB limit). Run it from a `diaric` checkout:
 
 ```bash
 # from a checkout of https://github.com/findit-studio/diaric
