@@ -147,7 +147,7 @@ gpu = [
 # one — a clean `diarization` clone with no sibling checkout must resolve).
 # T3 re-pins this to the diaric MERGE sha once the owner merges the diaric
 # PR.
-diaric = { git = "https://github.com/findit-studio/diaric", rev = "049b45acb29ce6fb58738b4565f6187dc34a94c8" }
+diaric = { git = "https://github.com/findit-studio/diaric", rev = "877189e434aff080c1340313caf8801cea946af3" }
 
 thiserror = "2"
 ort = { version = "2.0.0-rc.12", optional = true }
