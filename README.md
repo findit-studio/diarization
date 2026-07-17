@@ -123,23 +123,29 @@ Copyright (c) 2026 FinDIT studio authors.
 
 ### Bundled-model attributions propagate to downstream binaries
 
-`diarization` embeds two third-party model artifacts into every compiled
-binary via `include_bytes!`:
+`diarization` embeds one third-party model artifact of its own into every
+compiled binary via `include_bytes!`:
 
 | File | License | Source |
 |---|---|---|
 | `models/segmentation-3.0.onnx` (bundled when `bundled-segmentation` feature is on, default) | **MIT** | [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) |
-| `models/plda/*.bin` | **CC-BY-4.0** | [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) |
 
-The full SPDX expression is therefore
-`(MIT OR Apache-2.0) AND MIT AND CC-BY-4.0`. When you redistribute a
-binary that depends on `diarization`, reproduce the attributions from
-[NOTICE](https://github.com/Findit-AI/diarization/blob/main/NOTICE)
+This crate's own SPDX expression is therefore
+`(MIT OR Apache-2.0) AND MIT`. It also depends on
+[`diaric`](https://github.com/findit-studio/diaric), which embeds the
+CC-BY-4.0 PLDA weights — and vendors the SciPy / torchaudio / FluidAudio
+source ports — into any linking binary; those obligations are declared by
+`diaric`'s own SPDX expression and `NOTICE`.
+
+When you redistribute a binary that depends on `diarization`, reproduce the
+attributions from this crate's
+[NOTICE](https://github.com/Findit-AI/diarization/blob/main/NOTICE) **and**
+from [`diaric`'s NOTICE](https://github.com/findit-studio/diaric/blob/main/NOTICE)
 somewhere a recipient can find — for instance, in your application's
 "About" or third-party-licenses page. Full provenance:
 [models/SOURCE.md](https://github.com/Findit-AI/diarization/blob/main/models/SOURCE.md)
-(segmentation),
-[models/plda/SOURCE.md](https://github.com/Findit-AI/diarization/blob/main/models/plda/SOURCE.md)
+(segmentation) and diaric's
+[models/plda/SOURCE.md](https://github.com/findit-studio/diaric/blob/main/models/plda/SOURCE.md)
 (PLDA).
 
 To opt out of the segmentation bundling (e.g. to ship a fine-tuned

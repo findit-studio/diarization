@@ -111,9 +111,11 @@ ships:
 - `plda/xvec_transform.npz` (134 KB) — keys `mean1`, `mean2`, `lda` (256→128 LDA matrix).
 - `plda/plda.npz` (134 KB) — keys `mu`, `tr`, `psi`.
 
-License: CC-BY-4.0 (see `models/plda/SOURCE.md` for attribution). The
-capture script copies both to `models/plda/`; the Rust port (Phase 1+)
-reads them directly and must reproduce the same transformation.
+License: CC-BY-4.0. These weights are now owned by the `diaric`
+dependency, which embeds them as compiled blobs; refresh them with
+diaric's `scripts/export-plda-weights.py` (see diaric's
+`models/plda/SOURCE.md`). This parity harness no longer copies them into
+`models/plda/`.
 
 ## Refreshing or verifying the snapshot
 
@@ -125,8 +127,7 @@ must produce byte-identical artifacts.
 ```bash
 cd tests/parity/python
 
-# Refresh (overwrites every artifact under the fixture directory and
-# re-exports models/plda/{xvec_transform,plda}.npz):
+# Refresh (overwrites every artifact under the fixture directory):
 uv run python capture_intermediates.py \
   ../fixtures/01_dialogue/clip_16k.wav
 

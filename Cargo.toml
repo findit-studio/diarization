@@ -3,18 +3,21 @@ name = "diarization"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
-# `dia` source is MIT OR Apache-2.0 (caller's choice).
-# `models/plda/*.bin` are embedded into the compiled artifact via
-# `include_bytes!` (see `src/plda/loader.rs`); those weights are
-# CC-BY-4.0 with attribution required.
-# `models/segmentation-3.0.onnx` is embedded under the
-# `bundled-segmentation` feature (default-on) via `include_bytes!`
-# (see `src/segment/model.rs`); upstream license is MIT (BUT/Bohdal et
-# al., pyannote/segmentation-3.0). See `NOTICE` and `models/SOURCE.md`
-# for attribution. Downstream redistributors of any binary linking `dia`
-# MUST reproduce both the MIT segmentation attribution and the CC-BY-4.0
-# PLDA attribution.
-license = "(MIT OR Apache-2.0) AND MIT AND CC-BY-4.0 AND BSD-3-Clause"
+# `dia` source is MIT OR Apache-2.0 (caller's choice). The one third-party
+# artifact this crate bundles into its own compiled output is
+# `models/segmentation-3.0.onnx`, embedded under the `bundled-segmentation`
+# feature (default-on) via `include_bytes!` (see `src/segment/model.rs`);
+# upstream license is MIT (pyannote/segmentation-3.0, CNRS / Hervé Bredin).
+# Hence the SPDX below is `(MIT OR Apache-2.0) AND MIT`.
+#
+# The CC-BY-4.0 PLDA weights and the SciPy / torchaudio / FluidAudio source
+# ports now live in the `diaric` dependency, which embeds/vendors them into
+# any linking binary; their SPDX terms are declared by `diaric`, not
+# restated here. Downstream redistributors of any binary linking `dia` MUST
+# reproduce the MIT segmentation attribution AND `diaric`'s `NOTICE` (which
+# carries the CC-BY-4.0 PLDA and the BSD/Apache port attributions). See this
+# crate's `NOTICE` and `models/SOURCE.md`.
+license = "(MIT OR Apache-2.0) AND MIT"
 repository = "https://github.com/al8n/diarization"
 homepage = "https://github.com/al8n/diarization"
 documentation = "https://docs.rs/diarization"

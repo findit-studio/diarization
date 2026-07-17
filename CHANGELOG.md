@@ -90,9 +90,10 @@ PUBLIC SURFACE
   WeSpeaker ResNet34-LM is BYO; fetch it from
   `FinDIT-Studio/dia-models` on HuggingFace. The single-file packed
   ONNX is the canonical form.
-- **`diarization::plda`** — `PldaTransform::new()` (no args; weights
-  embedded via `include_bytes!`); CC-BY-4.0 with attribution
-  preserved in `NOTICE` and `models/plda/SOURCE.md`.
+- **`diarization::plda`** — `PldaTransform::new()` (no args), re-exported
+  from `diaric`, which embeds the weights via `include_bytes!`; CC-BY-4.0
+  with attribution preserved in `diaric`'s `NOTICE` and
+  `models/plda/SOURCE.md`.
 - **`diarization::cluster`** — `ahc`, `vbx`, `centroid`, `hungarian`
   submodules expose the algorithmic primitives directly for callers
   who want to wire their own pipeline.
