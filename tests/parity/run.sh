@@ -3,7 +3,6 @@
 #
 # Requires:
 # - models/segmentation-3.0.onnx and models/wespeaker_resnet34_lm.onnx
-# - models/plda/xvec_transform.npz and models/plda/plda.npz
 # - uv (https://docs.astral.sh/uv/)
 # - the clip path; defaults to the canonical 2-speaker fixture
 #

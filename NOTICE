@@ -32,36 +32,24 @@ For the SHA-256 of the bundled file and the refresh procedure see
 `models/SOURCE.md`.
 
 ────────────────────────────────────────────────────────────────────────
-2. pyannote/speaker-diarization-community-1 PLDA weights
+2. Third-party components embedded via the `diaric` dependency
 
-Embedded in the dia binary via `include_bytes!` (see
-`src/plda/loader.rs`):
+`diarization` depends on the `diaric` crate, which embeds and vendors
+third-party components that end up in any binary linking `diarization`:
 
-  models/plda/{mean1,mean2,lda,mu,tr,psi}.bin
-  models/plda/{eigenvectors_desc,phi_desc}.bin
-                                    (raw f64 extractions / scipy-derived
-                                     eigenvectors, compiled into the
-                                     binary)
-  models/plda/xvec_transform.npz   (134 KB; build-time source for mean1,
-                                    mean2, lda)
-  models/plda/plda.npz             (134 KB; build-time source for mu,
-                                    tr, psi)
+  - PLDA whitening weights (pyannote/speaker-diarization-community-1,
+    embedded via `include_bytes!`) — CC-BY-4.0, trained by BUT Speech@FIT;
+    pyannote integration by Jiangyu Han and Petr Pálka.
+  - A Rust port of SciPy's `rectangular_lsap.cpp` — BSD-3-Clause.
+  - A Rust port of `torchaudio.compliance.kaldi.fbank` — BSD-2-Clause.
+  - A Rust port of FluidAudio's `SpeakerManager` — Apache-2.0.
 
-Source:
-  HuggingFace pyannote/speaker-diarization-community-1
-  https://huggingface.co/pyannote/speaker-diarization-community-1
-  Snapshot revision: 3533c8cf8e369892e6b79ff1bf80f7b0286a54ee
+These components no longer live in this repository. Downstream
+redistributors of any binary linking `diarization` MUST also reproduce
+`diaric`'s NOTICE, which carries the full attribution text and license
+terms for each:
 
-License: CC-BY-4.0
-  https://creativecommons.org/licenses/by/4.0/
-
-Attribution (per upstream `plda/README.md` in the snapshot):
-  PLDA model trained by BUT Speech@FIT (https://speech.fit.vut.cz/).
-  Integration of VBx in pyannote.audio by Jiangyu Han and Petr Pálka.
-
-For the full provenance — including the original .npz layout, the
-internal array keys, and the refresh procedure — see
-`models/plda/SOURCE.md` in this repository.
+  https://github.com/findit-studio/diaric/blob/main/NOTICE
 
 ────────────────────────────────────────────────────────────────────────
 3. WeSpeaker ResNet34-LM embedding model (NOT bundled)
@@ -71,54 +59,3 @@ therefore NOT shipped with the crate. Callers obtain it via
 `scripts/download-embed-model.sh` (Apache-2.0 source from the
 WeSpeaker project; ONNX export from the `onnx-community` HuggingFace
 organization).
-
-────────────────────────────────────────────────────────────────────────
-4. SciPy `rectangular_lsap.cpp` — direct Rust port
-
-The file `src/cluster/hungarian/lsap.rs` is a Rust port of SciPy's
-`rectangular_lsap.cpp`, the C++ reference implementation backing
-`scipy.optimize.linear_sum_assignment`. Used for bit-for-bit
-tie-break parity with pyannote's `constrained_argmax`.
-
-Source:
-  scipy/scipy@main:scipy/optimize/rectangular_lsap/rectangular_lsap.cpp
-  https://github.com/scipy/scipy/blob/main/scipy/optimize/rectangular_lsap/rectangular_lsap.cpp
-
-Authors:
-  PM Larsen (port author, original SciPy contribution)
-  DF Crouse (algorithm, IEEE TAES 52(4):1679–1696, 2016 —
-  doi:10.1109/TAES.2016.140952)
-
-License: BSD-3-Clause
-
-  Copyright (c) 2008-2024, SciPy developers.
-  All rights reserved.
-
-  Redistribution and use in source and binary forms, with or without
-  modification, are permitted provided that the following conditions
-  are met:
-
-  1. Redistributions of source code must retain the above copyright
-     notice, this list of conditions and the following disclaimer.
-
-  2. Redistributions in binary form must reproduce the above
-     copyright notice, this list of conditions and the following
-     disclaimer in the documentation and/or other materials provided
-     with the distribution.
-
-  3. Neither the name of the copyright holder nor the names of its
-     contributors may be used to endorse or promote products derived
-     from this software without specific prior written permission.
-
-  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
-  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
-  COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
-  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
-  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
-  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
-  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-  POSSIBILITY OF SUCH DAMAGE.

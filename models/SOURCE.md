@@ -1,8 +1,11 @@
 # Bundled model files
 
-`dia` ships two pyannote model artifacts compiled into the binary via
-`include_bytes!`. Downstream redistributors must reproduce the
-attributions in `NOTICE` (CC-BY-4.0 for PLDA, MIT for segmentation).
+`dia` compiles the `pyannote/segmentation-3.0` model into its binary via
+`include_bytes!` (below). The PLDA whitening weights are embedded through
+the `diaric` dependency, not this crate's own tree. Downstream
+redistributors must reproduce the attributions in `NOTICE` (MIT for the
+bundled segmentation model) and in `diaric`'s `NOTICE` (CC-BY-4.0 for the
+PLDA weights).
 
 ## `segmentation-3.0.onnx`
 
@@ -25,15 +28,17 @@ who disable bundling. Refreshing the bundled file: re-run the script
 into `models/segmentation-3.0.onnx`, update the SHA-256 above, and
 re-run `cargo test`.
 
-## `plda/`
+## PLDA weights (embedded via the `diaric` dependency)
 
-PLDA whitening weights from
-`pyannote/speaker-diarization-community-1`. Embedded by
-`crate::plda::loader`. See `models/plda/SOURCE.md` for the full
-provenance + refresh procedure.
+The PLDA whitening weights from
+`pyannote/speaker-diarization-community-1` are no longer part of this
+crate: `diaric` owns `models/plda/` and embeds the blobs via
+`include_bytes!` in `diaric::plda`. See diaric's `models/plda/SOURCE.md`
+for the full provenance + refresh procedure.
 
 - **License:** CC-BY-4.0 (BUT Speech@FIT; pyannote integration by
-  Jiangyu Han and Petr Pálka)
+  Jiangyu Han and Petr Pálka). Attribution required — see `diaric`'s
+  `NOTICE`.
 
 ## NOT bundled — `wespeaker_resnet34_lm.onnx`
 

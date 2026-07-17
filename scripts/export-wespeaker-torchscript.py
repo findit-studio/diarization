@@ -98,7 +98,8 @@ class WeSpeakerOnnxWrapper(torch.nn.Module):
     ) -> torch.Tensor:
         # fbank: [N, num_frames, 80]; weights: [N, num_weights].
         # The Rust caller's `kaldi-native-fbank` ALREADY mean-centers
-        # the fbank across frames (see `src/embed/fbank.rs:127-138`),
+        # the fbank across frames (see the per-mel mean-centering in
+        # `diaric`'s `src/embed/fbank.rs`),
         # so this wrapper does NOT center. Passing the centered fbank
         # straight to the resnet matches the existing
         # `wespeaker_resnet34_lm.onnx` contract — only the weights

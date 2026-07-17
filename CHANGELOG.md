@@ -1,4 +1,98 @@
-# 0.2.0
+# 0.1.0 (2026-07-18)
+
+First published release. `diarization` is now the ONNX/Torch pyannote port
+layered on the backend-free [`diaric`](https://crates.io/crates/diaric) `0.1.0`
+core. The backend-free half of the crate — clustering, PLDA, pipeline
+assembly, reconstruction/RTTM, frame aggregation, provenance, the SIMD/mmap
+numeric ops + spill buffers, the sans-I/O segmentation state machine, and the
+fbank DSP — moved to the new `diaric` crate, which `diarization` depends on and
+re-exports so the existing `diarization::{cluster, plda, …}` paths keep
+resolving. What stays here is everything that needs the ONNX Runtime / libtorch:
+the segmentation + embedding model runners, the execution-provider surface, and
+the offline/streaming pipeline drivers.
+
+End-to-end DER vs pyannote 4.0.4 on the in-repo fixture suite is unchanged by
+the split (≤ 0.4 % on the worst clip, bit-exact on the rest); the move is a
+pure relocation of the numeric core behind a dependency edge.
+
+BREAKING (pre-1.0):
+
+- The backend-free core is no longer defined in this crate. It lives in
+  [`diaric`](https://crates.io/crates/diaric) `0.1.0` and is re-exported, so
+  most `use diarization::…` paths still resolve — but a `diarization` checkout
+  no longer builds these modules from local source, and their types are now
+  `diaric`'s (e.g. `diarization::plda::PldaTransform` is
+  `diaric::plda::PldaTransform`).
+- `diarization::ops` is gone from the public surface. The SIMD/mmap numeric
+  primitives are now internal to `diaric` and are not re-exported.
+- `segment::Error` and `embed::Error` each gained a transparent
+  `Core(#[from] diaric::…::Error)` wrapper and shed the variants that moved
+  with the core. Exhaustive `match` arms must now handle `Core` (and the
+  ONNX/Torch-specific `Ort` / `Tch` variants that stay here).
+
+MOVED TO `diaric` (re-exported; `diarization::*` paths unchanged)
+
+- **`diarization::cluster`** — AHC, VBx, centroid, Hungarian, plus the offline
+  (AHC→VBx) and online greedy-centroid clusterers and their options.
+- **`diarization::plda`** — `PldaTransform` (+ `RawEmbedding`); the CC-BY-4.0
+  weights are now embedded via `include_bytes!` inside `diaric`.
+- **`diarization::pipeline`** — `assign_embeddings` (AHC + VBx + centroid +
+  Hungarian) on already-projected post-PLDA features.
+- **`diarization::reconstruct`** — discrete grid + RTTM span emission.
+- **`diarization::aggregate`** — `count_pyannote` overlap-add speaker count.
+- **`diarization::provenance`** — `ModelIdentity` + family/version constants.
+- **`diarization::spill`** — `SpillOptions` / `SpillBytes[Mut]` file-backed
+  mmap fallback (was under the old `ops` module).
+- **`diarization::segment`** sans-I/O half — the `Segmenter` windowing/
+  hysteresis state machine, powerset decoding, `SegmentOptions`, and the value
+  types. The ONNX runner (`SegmentModel`) stays here.
+- **`diarization::embed`** DSP half — the torchaudio-compliance fbank port and
+  the embedding value types. The ONNX/Torch runner (`EmbedModel`) stays here.
+
+STAYS IN `diarization` (the ONNX/Torch port)
+
+- `segment::{SegmentModel, SegmentModelOptions, SegmenterExt}` — the ORT
+  segmentation runner plus the `SegmenterExt` extension trait that adds the
+  Layer-2 `process_samples` / `finish_stream` streaming driver to `diaric`'s
+  sans-I/O `Segmenter`.
+- `embed::EmbedModel` — the WeSpeaker runner (ONNX via `ort`, TorchScript via
+  `tch`).
+- `ep` — opt-in ORT execution providers (CoreML, CUDA, TensorRT, …) and
+  `auto_providers()`.
+- `offline` — `OfflineInput` / `diarize_offline` and the `ort`-backed
+  `OwnedDiarizationPipeline`.
+- `streaming` — `StreamingOfflineDiarizer`, `StreamingEmbedder`,
+  `RangeEmbeddings`, `cluster_ranges`.
+
+CHANGED
+
+- Config validation delegates to `diaric`'s exposed predicates
+  (`diaric::offline::check_min_duration_off` / `check_smoothing_epsilon`)
+  instead of a re-implemented local copy, so this crate can never accept a
+  config that `diarize_offline` would later reject. `check_onset` stays local
+  (the onset knob only flows through the audio entrypoints).
+- License expression reduced to `(MIT OR Apache-2.0) AND MIT`. The CC-BY-4.0
+  PLDA weights and the SciPy / torchaudio / FluidAudio source ports moved into
+  `diaric`, which now declares their SPDX terms and carries their `NOTICE`; the
+  trailing `AND MIT` is this crate's own bundled `models/segmentation-3.0.onnx`
+  (pyannote/segmentation-3.0, MIT).
+- CI reduced to the jobs whose subject remains here: rustfmt, clippy, the
+  cross / cross-ort / windows-msvc build matrices, ep-bindings-check,
+  docs-rs-check, tch-compile-check, build, test, and coverage. The
+  memory-safety (Miri SB/TB, sanitizer) and SIMD (Intel SDE AVX2/AVX-512) gates
+  moved to `diaric` along with the `ops` code they exercised.
+
+
+---
+
+## Pre-release history (never published to crates.io)
+
+The milestones below were tracked internally while `diarization` was a single
+full-pipeline crate, before the `diaric` split. None of these versions were
+released to crates.io; the `0.1.0` above is the crate's first public release and
+supersedes them. They are preserved here for provenance.
+
+### Raw-embedding hand-off (internal, tagged 0.2.0)
 
 Raw-embedding hand-off: a desktop `segment+embed` node can now produce
 raw WeSpeaker vectors plus the segmentation/count structure clustering
@@ -38,7 +132,7 @@ CHANGED
   the 01_dialogue e2e parity remain green).
 
 
-# UNRELEASED
+### Full pyannote-community-1 pipeline (internal, formerly UNRELEASED)
 
 BREAKING (pre-1.0):
 
@@ -90,9 +184,10 @@ PUBLIC SURFACE
   WeSpeaker ResNet34-LM is BYO; fetch it from
   `FinDIT-Studio/dia-models` on HuggingFace. The single-file packed
   ONNX is the canonical form.
-- **`diarization::plda`** — `PldaTransform::new()` (no args; weights
-  embedded via `include_bytes!`); CC-BY-4.0 with attribution
-  preserved in `NOTICE` and `models/plda/SOURCE.md`.
+- **`diarization::plda`** — `PldaTransform::new()` (no args), re-exported
+  from `diaric`, which embeds the weights via `include_bytes!`; CC-BY-4.0
+  with attribution preserved in `diaric`'s `NOTICE` and
+  `models/plda/SOURCE.md`.
 - **`diarization::cluster`** — `ahc`, `vbx`, `centroid`, `hungarian`
   submodules expose the algorithmic primitives directly for callers
   who want to wire their own pipeline.
@@ -182,7 +277,7 @@ KNOWN LIMITATIONS / DEFERRED
   at the strict bit-exact level; tolerant per-frame coverage is in
   `reconstruct::parity_tests::reconstruct_within_tolerance_06_long_recording`.
 
-# 0.1.0 (2026-04-26)
+### Segmentation-only initial cut (internal, tagged 0.1.0, 2026-04-26)
 
 Initial release. Ships the `diarization::segment` module — Sans-I/O speaker
 segmentation backed by `pyannote/segmentation-3.0` ONNX.

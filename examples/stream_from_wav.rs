@@ -5,7 +5,7 @@
 
 #[cfg(all(feature = "ort", feature = "bundled-segmentation"))]
 fn main() -> anyhow::Result<()> {
-  use diarization::segment::{Event, SegmentModel, SegmentOptions, Segmenter};
+  use diarization::segment::{Event, SegmentModel, SegmentOptions, Segmenter, SegmenterExt};
 
   let path = std::env::args()
     .nth(1)

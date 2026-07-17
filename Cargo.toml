@@ -1,29 +1,33 @@
 [package]
 name = "diarization"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
-# `dia` source is MIT OR Apache-2.0 (caller's choice).
-# `models/plda/*.bin` are embedded into the compiled artifact via
-# `include_bytes!` (see `src/plda/loader.rs`); those weights are
-# CC-BY-4.0 with attribution required.
-# `models/segmentation-3.0.onnx` is embedded under the
-# `bundled-segmentation` feature (default-on) via `include_bytes!`
-# (see `src/segment/model.rs`); upstream license is MIT (BUT/Bohdal et
-# al., pyannote/segmentation-3.0). See `NOTICE` and `models/SOURCE.md`
-# for attribution. Downstream redistributors of any binary linking `dia`
-# MUST reproduce both the MIT segmentation attribution and the CC-BY-4.0
-# PLDA attribution.
-license = "(MIT OR Apache-2.0) AND MIT AND CC-BY-4.0 AND BSD-3-Clause"
+# `dia` source is MIT OR Apache-2.0 (caller's choice). The one third-party
+# artifact this crate bundles into its own compiled output is
+# `models/segmentation-3.0.onnx`, embedded under the `bundled-segmentation`
+# feature (default-on) via `include_bytes!` (see `src/segment/model.rs`);
+# upstream license is MIT (pyannote/segmentation-3.0, CNRS / Hervé Bredin).
+# Hence the SPDX below is `(MIT OR Apache-2.0) AND MIT`.
+#
+# The CC-BY-4.0 PLDA weights and the SciPy / torchaudio / FluidAudio source
+# ports now live in the `diaric` dependency, which embeds/vendors them into
+# any linking binary; their SPDX terms are declared by `diaric`, not
+# restated here. Downstream redistributors of any binary linking `dia` MUST
+# reproduce the MIT segmentation attribution AND `diaric`'s `NOTICE` (which
+# carries the CC-BY-4.0 PLDA and the BSD/Apache port attributions). See this
+# crate's `NOTICE` and `models/SOURCE.md`.
+license = "(MIT OR Apache-2.0) AND MIT"
 repository = "https://github.com/al8n/diarization"
 homepage = "https://github.com/al8n/diarization"
 documentation = "https://docs.rs/diarization"
-description = "Sans-I/O speaker diarization for streaming audio. Bundles the pyannote/segmentation-3.0 model and the speaker-diarization-community-1 PLDA weights — only the WeSpeaker embedding ONNX is BYO."
+description = "Sans-I/O speaker diarization for streaming audio. Bundles the pyannote/segmentation-3.0 model and sources the speaker-diarization-community-1 PLDA weights from its diaric dependency — only the WeSpeaker embedding ONNX is BYO."
 readme = "README.md"
 # Keep `cargo package` lean. crates.io's hard limit is 10 MB
-# compressed; we ship the bundled segmentation model (~6 MB) and
-# PLDA `.bin` blobs (~530 KB) which are loaded via `include_bytes!`
-# at runtime, but everything else dev-only is excluded.
+# compressed; we ship the bundled segmentation model (~6 MB), loaded
+# via `include_bytes!` at runtime, but everything else dev-only is
+# excluded. (The PLDA `.bin` blobs now ship inside the `diaric`
+# dependency, not this crate.)
 #
 # Verify with `cargo package --list --allow-dirty` and
 # `ls -lh /Users/user/.cargo/target/package/diarization-*.crate`.
@@ -39,10 +43,6 @@ exclude = [
   "models/wespeaker_resnet34_lm.onnx.data",
   "models/wespeaker_resnet34_lm.pt",
   "models/wespeaker_resnet34_lm_packed.onnx",
-  # PLDA `.npz` files — build-time sources for the `.bin` extraction
-  # in `scripts/extract-plda-blobs.sh`; production code never reads
-  # them. The `.bin` blobs are the runtime data and DO ship.
-  "models/plda/*.npz",
   # Parity sub-workspace (its own `Cargo.toml` makes cargo skip
   # this by default; listed defensively so removing the inner
   # `[workspace]` later doesn't suddenly bloat the crate).
@@ -70,7 +70,10 @@ default = ["ort", "bundled-segmentation"]
 # foreign types (`ort::session::builder::GraphOptimizationLevel`)
 # are bridged through wrapper modules. Off by default to keep the
 # default dep graph minimal.
-serde = ["dep:serde", "dep:humantime-serde"]
+# Also propagates to `diaric/serde` so the re-exported `SpillOptions` (and
+# any other `diaric` config type embedded in this crate's `*Options`) gets
+# its `Serialize`/`Deserialize` impls.
+serde = ["dep:serde", "dep:humantime-serde", "diaric/serde"]
 ort = ["dep:ort"]
 # Embed `models/segmentation-3.0.onnx` (~6 MB) into the compiled artifact
 # via `include_bytes!` so callers can construct `SegmentModel::bundled()`
@@ -136,67 +139,23 @@ gpu = [
   "rocm",
   "webgpu",
 ]
-# Internal feature for benchmarks. Exposes pub(crate) modules
-# (`vbx`, `ahc`, `centroid`, `pipeline`, `reconstruct`, `hungarian`,
-# `plda`) as `pub` so external benches in `benches/*.rs` can call the
-# inner kernels directly. Not part of the public API contract — the
-# `_` prefix marks it as private.
-_bench = []
-
 [dependencies]
-mediatime = "0.1"
+# The backend-free diarization core: clustering (offline AHC→VBx, online),
+# PLDA projection, pipeline assembly, reconstruction/RTTM, frame
+# aggregation, provenance, kaldi-fbank DSP + embedding value types, and
+# the SIMD/mmap numeric ops (including the `axpy_f32` embedding-aggregation
+# primitive). Everything ort/tch-free that this crate used to define now
+# lives in `diaric` and is re-exported from `lib.rs`.
+#
+# Published on crates.io as diaric 0.1.0 — the same content as the diaric #1
+# `main` merge commit this crate was rev-pinned to before publication.
+# `cargo publish` rejects git dependencies, so the release depends on the
+# registry version (the caret requirement resolves any 0.1.x patch).
+diaric = "0.1.0"
+
 thiserror = "2"
 ort = { version = "2.0.0-rc.12", optional = true }
 tch = { version = "0.24", optional = true }
-
-# Real-valued FFT for the bit-exact torchaudio.compliance.kaldi.fbank
-# port (see `src/embed/fbank.rs`). PyTorch's `torch.fft.rfft`
-# routes to pocketfft on CPU; `realfft` wraps `rustfft`'s
-# Cooley-Tukey radix-2 path which produces the same spectrum within
-# ~1e-7 relative — small enough that the resnet+pooling output stays
-# within sub-ULP of pyannote on the 14-audio bench.
-realfft = "3"
-nalgebra = "0.34"
-rand = { version = "0.10", default-features = false }
-rand_chacha = { version = "0.10", default-features = false }
-
-# AHC initialization (centroid-method linkage).
-kodama = "0.3"
-
-# Allocation-free integer→decimal-string rendering for pyannote's
-# `Annotation.labels()` lex-sort (cluster id → SPEAKER_NN label
-# remapping in RTTM emission).
-itoa = "1"
-
-# Spill backend: AHC pdist / reconstruct grid / aggregate frame
-# buffers cross 256 MB on pathological inputs. The spill module
-# falls back to file-backed mmap above the configurable threshold
-# so the same inputs succeed at the cost of disk I/O instead of
-# OOM-aborting the `Result`-returning pipeline. See
-# `src/ops/spill.rs`.
-memmapix = "0.9"
-bytemuck = "1"
-tempfile = "3"
-# Cross-platform `File::allocate` for the spill backend
-# (`posix_fallocate` on Linux, `F_PREALLOCATE` on macOS,
-# `SetFileValidData`/`SetEndOfFile` on Windows). Reserves disk blocks
-# before mmap so writes through the mapping cannot `SIGBUS` on
-# `ENOSPC`.
-fs4 = "1"
-
-# `rustix::fs::OFlags::TMPFILE` on Linux/Android: the spill backend
-# opens an anonymous (never-linked) tempfile so there is no race
-# window between create + unlink for a same-UID process to grab a
-# writable fd. `tempfile`'s Linux fast path also tries `O_TMPFILE`
-# but silently falls back to `mkstemp + unlink` on filesystems
-# without support — we want to surface that as a typed error
-# instead.
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { version = "1", features = ["fs"] }
-
-# Cross-platform optional deps below. They MUST stay outside the
-# `[target.'cfg(...)']` block above — that block scopes its entries
-# to Linux/Android only.
 
 # `serde` impls for the public `*Options` / `*Config` types so
 # callers can persist diarization configuration.
@@ -214,7 +173,6 @@ optional = true
 
 [dev-dependencies]
 anyhow = "1"
-criterion = "0.8"
 hound = "3"
 # Sister `silero` crate (VAD for streaming voice-range detection).
 # Only the `run_streaming_pipeline` example consumes it — the lib
@@ -225,9 +183,10 @@ hound = "3"
 # access to dev-dependencies, so keeping it here both lightens the
 # public dependency graph and the feature surface.
 silero = "0.4"
-# `diarization::plda` parity tests load captured `.npz` artifacts.
-# Production code embeds the PLDA weights via `include_bytes!` and
-# does not depend on npyz.
+# `.npz` fixture loading for the ONNX end-to-end parity tests
+# (`tests/parity_drift_10.rs`, `tests/parity_fixtures_endtoend.rs`) and the
+# `run_offline_from_captures` example. Production code embeds the PLDA
+# weights via `include_bytes!` (in `diaric`) and does not depend on npyz.
 npyz = { version = "0.9", features = ["npz"] }
 # Used by the `serde` feature's roundtrip tests.
 serde_json = "1"
@@ -251,55 +210,10 @@ name = "run_streaming_pipeline"
 # dev-dependency, always available to examples — no feature gate.
 required-features = ["ort", "bundled-segmentation"]
 
-[[bench]]
-path = "benches/segment.rs"
-name = "segment"
-harness = false
-
-[[bench]]
-path = "benches/ops.rs"
-name = "ops"
-harness = false
-required-features = ["_bench"]
-
-[[bench]]
-path = "benches/vbx.rs"
-name = "vbx"
-harness = false
-required-features = ["_bench"]
-
-[[bench]]
-path = "benches/ahc.rs"
-name = "ahc"
-harness = false
-required-features = ["_bench"]
-
-[[bench]]
-path = "benches/centroid.rs"
-name = "centroid"
-harness = false
-required-features = ["_bench"]
-
-[[bench]]
-path = "benches/pipeline.rs"
-name = "pipeline"
-harness = false
-required-features = ["_bench"]
-
-[profile.bench]
-opt-level = 3
-debug = false
-codegen-units = 1
-lto = "thin"
-incremental = false
-debug-assertions = false
-overflow-checks = false
-rpath = false
-
 [package.metadata.docs.rs]
 # Pin the docs.rs feature set explicitly. `all-features = true`
-# would enable `tch` (needs LIBTORCH on the build host) and the
-# `_bench` internal feature — neither of which docs.rs provides.
+# would enable `tch`, which needs LIBTORCH on the build host —
+# something docs.rs does not provide.
 # The list below covers the full public API surface: default
 # (`ort` + `bundled-segmentation`), optional `serde`, and EVERY per-EP
 # feature so that every `dia::ep::*` re-export and `#[doc(cfg(...))]`

@@ -42,6 +42,7 @@ jobs:
   clippy:
     name: clippy
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -57,8 +58,7 @@ jobs:
       run: cargo install cargo-hack
     - name: Apply clippy lints
       # Exclude `tch` (libtorch env-dep) from the each-feature sweep —
-      # it has its own dedicated CI job. `silero-vad` IS swept now
-      # that `silero` is a registry dep. The per-EP features
+      # it has its own dedicated CI job. The per-EP features
       # (`coreml`/`cuda`/`tensorrt`/...) and the `gpu` meta-feature
       # are also excluded: `each-feature` would build them
       # individually but `ort-sys 2.0.0-rc.12`'s prebuilt
@@ -80,6 +80,7 @@ jobs:
   cross:
     name: cross (scalar, --no-default-features)
     strategy:
+      fail-fast: false
       matrix:
         # `wasm32-unknown-unknown` is intentionally excluded here:
         # the transitive `getrandom 0.2` dep emits a `compile_error!`
@@ -141,6 +142,7 @@ jobs:
   cross-ort:
     name: cross (ort + bundled-segmentation)
     strategy:
+      fail-fast: false
       matrix:
         # Targets where `ort-sys 2.0.0-rc.12` ships a prebuilt
         # archive via `download-binaries`. Windows MSVC is covered
@@ -285,7 +287,7 @@ jobs:
           RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links --cfg docsrs"
         run: |
           cargo doc --no-deps --features \
-            ort,bundled-segmentation,serde,silero-vad,coreml,cuda,tensorrt,directml,rocm,migraphx,openvino,webgpu,xnnpack,onednn,cann,acl,qnn,nnapi,tvm,azure
+            ort,bundled-segmentation,serde,coreml,cuda,tensorrt,directml,rocm,migraphx,openvino,webgpu,xnnpack,onednn,cann,acl,qnn,nnapi,tvm,azure
 
   # Compile check for the `tch` (TorchScript) backend. `tch` is not in
   # the cargo-hack feature sweeps below because it requires libtorch
@@ -318,13 +320,14 @@ jobs:
         # separate libtorch tarball download.
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python3 -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.11.*"
       - name: cargo check --no-default-features --features tch
         run: cargo check --lib --no-default-features --features tch
 
   build:
     name: build
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -361,6 +364,7 @@ jobs:
   test:
     name: test
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -391,210 +395,6 @@ jobs:
       # steps; per-EP coverage is in `ep-link-check`).
       run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features tch,coreml,cuda,tensorrt,directml,rocm,migraphx,openvino,webgpu,xnnpack,onednn,cann,acl,qnn,nnapi,tvm,azure,gpu
 
-  # AVX2 + FMA correctness via Intel SDE. GH free runners may have AVX2
-  # natively, but our dispatcher prefers AVX-512F on hosts that have it
-  # — which would skip the AVX2 backend entirely. SDE pinned to a
-  # Haswell CPU model emulates AVX2 + FMA without AVX-512, forcing the
-  # AVX2 branch under emulation. Codex CI sweep.
-  avx2-sde:
-    name: AVX2 (Intel SDE)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-sde-avx2-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sde-avx2-
-      - name: Install Rust
-        run: rustup update stable && rustup default stable
-      - name: Run AVX2 SIMD tests under SDE
-        run: bash ci/sde_avx2.sh
-
-  # AVX-512F correctness via Intel SDE. Free GitHub runners are AMD
-  # EPYC Milan (no AVX-512) or older Intel Xeons — neither has AVX-512
-  # reliably. Without this job, a reduction-or-load mistake in the
-  # unsafe AVX-512 path would only surface on production AVX-512 hosts
-  # (Sapphire Rapids, Zen 4, etc.). SDE emulates AVX-512 in software
-  # so the dispatcher picks the AVX-512 path under emulation and the
-  # differential tests in `ops::` exercise it. Codex CI sweep.
-  avx512-sde:
-    name: AVX-512 (Intel SDE)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-sde-avx512-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sde-avx512-
-      - name: Install Rust
-        run: rustup update stable && rustup default stable
-      - name: Run AVX-512 SIMD tests under SDE
-        run: bash ci/sde_avx512.sh
-
-  # NEON correctness on a pinned native arm64 runner.
-  #
-  # The AVX SDE jobs cover x86 SIMD; the cross/test matrix
-  # `macos-latest` happens to be Apple Silicon today, but its
-  # architecture is a label-resolution detail that GitHub can change.
-  # Miri forces `--cfg diarization_force_scalar`, so it does not
-  # exercise the unsafe NEON kernels either. Without an arm64-pinned
-  # job, a load/deinterleave/tail bug in `dot_neon`, `window_mul_neon`,
-  # or `power_neon` could ship while every required safety job stayed
-  # green.
-  #
-  # Pattern mirrors `avx2-sde` / `avx512-sde`. Sets
-  # `--cfg diarization_assert_neon` so
-  # `dispatch_selects_neon_under_native_arm64` (in
-  # `ops::backend_selection_tests`) fails the build if NEON dispatch
-  # ever falls back to scalar on this runner.
-  neon-native:
-    name: NEON (native arm64)
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-neon-native-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-neon-native-
-      - name: Install Rust
-        run: rustup update stable && rustup default stable
-      - name: "Run fbank + ops:: tests on arm64 (NEON dispatched)"
-        # `--cfg diarization_assert_neon` enables the
-        # `dispatch_selects_neon_under_native_arm64` test in
-        # `ops::backend_selection_tests`, failing if the runner image
-        # ever stops detecting NEON. Test scope mirrors `ci/sde_avx*.sh`:
-        # ops:: + embed::fbank::tests + the parity test modules whose
-        # threshold-sensitive decisions could flip under reduction-order
-        # drift.
-        env:
-          RUSTFLAGS: "-Dwarnings --cfg diarization_assert_neon"
-        run: |
-          cargo test \
-            --lib --no-default-features \
-            -- \
-            ops:: \
-            embed::fbank::tests \
-            pipeline::parity_tests \
-            cluster::ahc::parity_tests \
-            cluster::vbx::parity_tests \
-            cluster::centroid::parity_tests \
-            offline::parity_tests \
-            reconstruct::parity_tests \
-            aggregate::parity_tests \
-            plda::parity_tests
-
-  sanitizer:
-    name: sanitizer
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-sanitizer-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sanitizer-
-      - name: Install Rust
-        run: rustup update nightly && rustup default nightly
-      - name: Install rust-src
-        run: rustup component add rust-src
-      - name: ASAN / LSAN / MSAN / TSAN
-        run: bash ci/sanitizer.sh
-
-  miri-tb:
-    name: miri-tb-${{ matrix.target }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: i686-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: powerpc64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: s390x-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-miri-
-      - name: Miri
-        run: |
-          bash ci/miri_tb.sh "${{ matrix.target }}"
-
-  miri-sb:
-    name: miri-sb-${{ matrix.target }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: i686-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: powerpc64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: s390x-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-miri-
-      - name: Miri
-        run: |
-          bash ci/miri_sb.sh "${{ matrix.target }}" 
-
   coverage:
     name: coverage
     runs-on: ubuntu-latest
@@ -604,12 +404,6 @@ jobs:
       - build
       - cross
       - test
-      - sanitizer
-      - miri-tb
-      - miri-sb
-      - avx2-sde
-      - avx512-sde
-      - neon-native
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust
@@ -631,10 +425,8 @@ jobs:
           RUSTFLAGS: "--cfg tarpaulin"
         # Explicit feature list instead of `--all-features`: the `tch`
         # backend needs libtorch on the runner (handled only by the
-        # dedicated `tch-compile-check` job). `silero-vad` is enabled
-        # below because the streaming example is documented as a
-        # supported quickstart and we want coverage to exercise it.
-        run: cargo tarpaulin --features ort,bundled-segmentation,serde,silero-vad,_bench --run-types tests --run-types doctests --workspace --out xml
+        # dedicated `tch-compile-check` job).
+        run: cargo tarpaulin --features ort,bundled-segmentation,serde --run-types tests --run-types doctests --workspace --out xml
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v6
         with:

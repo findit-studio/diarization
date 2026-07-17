@@ -19,9 +19,11 @@ Sans-I/O speaker diarization with pyannote-equivalent accuracy.
 
 ## Quick start
 
-The segmentation model and PLDA weights ship inside the crate — only the
-WeSpeaker ResNet34-LM embedding ONNX is BYO (~26 MB; above the
-crates.io 10 MB hard limit, so it cannot be bundled). Fetch it from the
+The segmentation model ships inside this crate, and the PLDA weights ship
+inside its [`diaric`](https://crates.io/crates/diaric) dependency (a published
+crate) — both embed into your binary automatically, so only the WeSpeaker
+ResNet34-LM embedding ONNX is BYO (~26 MB; above the crates.io 10 MB hard
+limit, so it cannot be bundled). Fetch it from the
 [FinDIT-Studio/dia-models](https://huggingface.co/FinDIT-Studio/dia-models)
 HuggingFace bundle. Both commands below pin a specific HF commit and
 verify SHA-256 before installing — a republished or truncated upstream
@@ -99,16 +101,23 @@ location if you keep the model elsewhere.
 `silero` is tracked as a dev-dependency (only `examples/run_streaming_pipeline.rs`
 consumes it). No feature gate — examples have access to dev-deps.
 
-The PLDA parity test runs as part of the regular test suite — no
-feature flag required:
+The PLDA parity suite moved to the [`diaric`](https://crates.io/crates/diaric)
+dependency along with the backend-free core; it lives in `diaric`'s
+`src/plda/parity_tests.rs` (API docs at [docs.rs/diaric](https://docs.rs/diaric)).
+`diaric` is a published crate, but running its parity suite still needs a source
+checkout: Cargo does not run a dependency's unit tests through re-exports (so the
+filter matches 0 tests here), and the `.npz` fixtures those tests read are
+checked into the `diaric` repo rather than shipped in the published crate tarball
+(they would blow the crates.io 10 MB limit). Run it from a `diaric` checkout:
 
 ```bash
+# from a checkout of https://github.com/findit-studio/diaric
 cargo test plda::parity_tests
 ```
 
 It auto-skips when `tests/parity/fixtures/01_dialogue/*.npz` is absent
-(checked-in for this repo, but a fresh checkout from a model-only
-mirror would have to regenerate them via the Phase-0 capture script).
+(checked in to `diaric`, but a fresh checkout from a model-only mirror
+would have to regenerate them via the Phase-0 capture script).
 
 ## License
 
@@ -123,23 +132,29 @@ Copyright (c) 2026 FinDIT studio authors.
 
 ### Bundled-model attributions propagate to downstream binaries
 
-`diarization` embeds two third-party model artifacts into every compiled
-binary via `include_bytes!`:
+`diarization` embeds one third-party model artifact of its own into every
+compiled binary via `include_bytes!`:
 
 | File | License | Source |
 |---|---|---|
 | `models/segmentation-3.0.onnx` (bundled when `bundled-segmentation` feature is on, default) | **MIT** | [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) |
-| `models/plda/*.bin` | **CC-BY-4.0** | [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) |
 
-The full SPDX expression is therefore
-`(MIT OR Apache-2.0) AND MIT AND CC-BY-4.0`. When you redistribute a
-binary that depends on `diarization`, reproduce the attributions from
-[NOTICE](https://github.com/Findit-AI/diarization/blob/main/NOTICE)
+This crate's own SPDX expression is therefore
+`(MIT OR Apache-2.0) AND MIT`. It also depends on
+[`diaric`](https://github.com/findit-studio/diaric), which embeds the
+CC-BY-4.0 PLDA weights — and vendors the SciPy / torchaudio / FluidAudio
+source ports — into any linking binary; those obligations are declared by
+`diaric`'s own SPDX expression and `NOTICE`.
+
+When you redistribute a binary that depends on `diarization`, reproduce the
+attributions from this crate's
+[NOTICE](https://github.com/Findit-AI/diarization/blob/main/NOTICE) **and**
+from [`diaric`'s NOTICE](https://github.com/findit-studio/diaric/blob/main/NOTICE)
 somewhere a recipient can find — for instance, in your application's
 "About" or third-party-licenses page. Full provenance:
 [models/SOURCE.md](https://github.com/Findit-AI/diarization/blob/main/models/SOURCE.md)
-(segmentation),
-[models/plda/SOURCE.md](https://github.com/Findit-AI/diarization/blob/main/models/plda/SOURCE.md)
+(segmentation) and diaric's
+[models/plda/SOURCE.md](https://github.com/findit-studio/diaric/blob/main/models/plda/SOURCE.md)
 (PLDA).
 
 To opt out of the segmentation bundling (e.g. to ship a fine-tuned

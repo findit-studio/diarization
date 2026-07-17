@@ -26,7 +26,6 @@ use crate::{
   aggregate::try_count_pyannote,
   embed::{EMBEDDING_DIM, EmbedModel},
   offline::{Error, OfflineInput, OfflineOutput, diarize_offline},
-  ops::spill::SpillOptions,
   plda::PldaTransform,
   reconstruct::SlidingWindow,
   segment::{
@@ -34,7 +33,16 @@ use crate::{
     SAMPLE_RATE_HZ, SegmentModel, WINDOW_SAMPLES,
     powerset::{powerset_to_speakers_hard, softmax_row},
   },
+  spill::SpillOptions,
 };
+
+// `min_duration_off` / `smoothing_epsilon` are validated against the single
+// diaric-owned authority — `OwnedPipelineOptions` forwards both into
+// `OfflineInput`, so accepting a value `diarize_offline` would later reject
+// is a drift bug. Call diaric's exposed predicates rather than re-deriving
+// the bounds. (`check_onset` stays local above: the onset knob only flows
+// through the audio entrypoints, which diaric's tensor path does not model.)
+use diaric::offline::{check_min_duration_off, check_smoothing_epsilon};
 
 /// Number of speaker slots per chunk. Pyannote `segmentation-3.0`
 /// trains on 3 simultaneous speakers (the 7 powerset classes).
@@ -54,13 +62,6 @@ pub(crate) const fn check_onset(v: f32) -> bool {
   let not_nan = !(v != v);
   not_nan && v > 0.0 && v <= 1.0
 }
-
-// `check_min_duration_off` / `check_smoothing_epsilon` live in
-// `crate::offline::algo` (always-on, not ort-gated) so the pure
-// `diarize_offline` tensor API can reuse the same predicates as the
-// audio entrypoints. We import them here for the
-// `OwnedPipelineOptions` builder-side panics + run() runtime checks.
-use crate::offline::algo::{check_min_duration_off, check_smoothing_epsilon};
 
 /// Configuration for [`OwnedDiarizationPipeline`].
 ///
@@ -93,7 +94,7 @@ pub struct OwnedPipelineOptions {
   /// [`SpillOptions::default`] (64 MiB heap threshold,
   /// [`std::env::temp_dir`] spill directory).
   /// [`OwnedDiarizationPipeline::run`] passes this by reference to
-  /// every [`crate::ops::spill::SpillBytesMut::zeros`] reached transitively
+  /// every [`crate::spill::SpillBytesMut::zeros`] reached transitively
   /// (AHC pdist, reconstruct grids, count buffers), so per-call
   /// configuration is local — no process-global side-effects.
   #[cfg_attr(feature = "serde", serde(default))]
@@ -354,7 +355,8 @@ impl OwnedDiarizationPipeline {
   ///
   /// # Errors
   ///
-  /// - [`Error::Shape`] if `samples` is empty or shorter than one
+  /// - [`Error::Core`] wrapping a [`crate::offline::ShapeError`] if `samples`
+  ///   is empty or shorter than one
   ///   segmentation window (`WINDOW_SAMPLES = 160_000` = 10 s).
   /// - All other errors propagate from the underlying ONNX inference,
   ///   PLDA, AHC, VBx, centroid, Hungarian, or reconstruct stages.
@@ -367,18 +369,18 @@ impl OwnedDiarizationPipeline {
   ) -> Result<OfflineOutput, Error> {
     let cfg = &self.options;
     if samples.is_empty() {
-      return Err(crate::offline::algo::ShapeError::EmptySamples.into());
+      return Err(crate::offline::ShapeError::EmptySamples.into());
     }
     let win = WINDOW_SAMPLES as usize;
     let step = cfg.step_samples() as usize;
     if step == 0 {
-      return Err(crate::offline::algo::ShapeError::ZeroStepSamples.into());
+      return Err(crate::offline::ShapeError::ZeroStepSamples.into());
     }
     // Defense-in-depth: `with_step_samples` panics on > WINDOW_SAMPLES,
     // but serde-deserialized configs bypass that path. Reject here too.
     if step > win {
       return Err(
-        crate::offline::algo::ShapeError::StepSamplesExceedsWindow {
+        crate::offline::ShapeError::StepSamplesExceedsWindow {
           step: cfg.step_samples(),
           window: WINDOW_SAMPLES,
         }
@@ -389,7 +391,7 @@ impl OwnedDiarizationPipeline {
     // degenerates with NaN/`> 1.0` (all-inactive → empty diarization)
     // or `<= 0.0` (all-active → corrupted frame masks).
     if !check_onset(cfg.onset()) {
-      return Err(crate::offline::algo::ShapeError::OnsetOutOfRange { onset: cfg.onset() }.into());
+      return Err(crate::offline::ShapeError::OnsetOutOfRange { onset: cfg.onset() }.into());
     }
     // Same defense-in-depth for `min_duration_off` and
     // `smoothing_epsilon`. Both flow into reconstruction/RTTM
@@ -399,7 +401,7 @@ impl OwnedDiarizationPipeline {
     // modes each catches.
     if !check_min_duration_off(cfg.min_duration_off()) {
       return Err(
-        crate::offline::algo::ShapeError::MinDurationOffOutOfRange {
+        crate::offline::ShapeError::MinDurationOffOutOfRange {
           value: cfg.min_duration_off(),
         }
         .into(),
@@ -407,7 +409,7 @@ impl OwnedDiarizationPipeline {
     }
     if !check_smoothing_epsilon(cfg.smoothing_epsilon()) {
       return Err(
-        crate::offline::algo::ShapeError::SmoothingEpsilonOutOfRange {
+        crate::offline::ShapeError::SmoothingEpsilonOutOfRange {
           value: cfg.smoothing_epsilon(),
         }
         .into(),
@@ -460,7 +462,7 @@ impl OwnedDiarizationPipeline {
     // bounded and large allocations fall back to file-backed mmap.
     let segs_len = num_chunks * FRAMES_PER_WINDOW * SLOTS_PER_CHUNK;
     let mut segmentations =
-      crate::ops::spill::SpillBytesMut::<f64>::zeros(segs_len, cfg.spill_options())?;
+      crate::spill::SpillBytesMut::<f64>::zeros(segs_len, cfg.spill_options())?;
     let segs = segmentations.as_mut_slice();
 
     for c in 0..num_chunks {
@@ -501,7 +503,7 @@ impl OwnedDiarizationPipeline {
     // ── Stage 2: per-(chunk, slot) masked embedding ────────────────
     let emb_len = num_chunks * SLOTS_PER_CHUNK * EMBEDDING_DIM;
     let mut raw_embeddings =
-      crate::ops::spill::SpillBytesMut::<f32>::zeros(emb_len, cfg.spill_options())?;
+      crate::spill::SpillBytesMut::<f32>::zeros(emb_len, cfg.spill_options())?;
     let embs = raw_embeddings.as_mut_slice();
 
     // Pyannote's `get_embeddings` (community-1 default
@@ -599,8 +601,8 @@ impl OwnedDiarizationPipeline {
         // bit-exact pyannote.
         let raw = match embed_model.embed_chunk_with_frame_mask(&padded_chunk, &used_mask) {
           Ok(v) => v,
-          Err(crate::embed::Error::InvalidClip { .. })
-          | Err(crate::embed::Error::DegenerateEmbedding) => {
+          Err(crate::embed::Error::Core(diaric::embed::Error::InvalidClip { .. }))
+          | Err(crate::embed::Error::Core(diaric::embed::Error::DegenerateEmbedding)) => {
             for f in 0..FRAMES_PER_WINDOW {
               segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
             }
@@ -614,7 +616,7 @@ impl OwnedDiarizationPipeline {
         // corruption into "inactive speaker" and producing diarization
         // with missing speech instead of surfacing the failure.
         if raw.iter().any(|v| !v.is_finite()) {
-          return Err(crate::embed::Error::NonFiniteOutput.into());
+          return Err(crate::embed::Error::Core(diaric::embed::Error::NonFiniteOutput).into());
         }
         // Pre-validate: if the raw norm is below the PLDA min, drop.
         // PLDA min is 0.01 (RawEmbedding::from_raw_array). Computing
@@ -693,7 +695,7 @@ impl OwnedDiarizationPipeline {
     .with_min_duration_off(cfg.min_duration_off())
     .with_smoothing_epsilon(cfg.smoothing_epsilon())
     .with_spill_options(cfg.spill_options().clone());
-    diarize_offline(&input)
+    diarize_offline(&input).map_err(Error::Core)
   }
 }
 
@@ -779,6 +781,12 @@ mod option_validation_tests {
   }
 
   // ── min_duration_off / smoothing_epsilon validation ──────────────
+  //
+  // The predicates (`check_min_duration_off`, `check_smoothing_epsilon`)
+  // are owned by `diaric` and imported from `diaric::offline`. These
+  // contract guards pin that this crate validates against that single
+  // authority: a diaric bound change surfaces here rather than letting the
+  // preflight silently diverge from what `diarize_offline` enforces.
 
   #[test]
   fn check_min_duration_off_predicate() {

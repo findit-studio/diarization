@@ -33,7 +33,6 @@ from pathlib import Path
 import numpy as np
 import pyannote.audio
 from einops import rearrange
-from huggingface_hub import snapshot_download
 from pyannote.audio import Pipeline
 from pyannote.audio.pipelines.clustering import VBxClustering
 from pyannote.audio.utils.vbx import VBx
@@ -257,20 +256,6 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _export_plda_weights(repo_root: Path) -> None:
-    """Copy plda/xvec_transform.npz + plda/plda.npz from HF cache to models/plda/."""
-    snap = Path(snapshot_download(PIPELINE_NAME))
-    dst = repo_root / "models" / "plda"
-    dst.mkdir(parents=True, exist_ok=True)
-    for fname in ("xvec_transform.npz", "plda.npz"):
-        src = snap / "plda" / fname
-        if not src.exists():
-            raise SystemExit(f"could not find {src} in HF snapshot")
-        target = dst / fname
-        target.write_bytes(src.read_bytes())
-        print(f"[capture] exported {fname} -> {target.relative_to(repo_root)}")
-
-
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: capture_intermediates.py <clip.wav>")
@@ -423,8 +408,9 @@ def main() -> None:
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-    repo_root = Path(__file__).resolve().parents[3]
-    _export_plda_weights(repo_root)
+    # PLDA weight refresh moved to `diaric` (scripts/export-plda-weights.py):
+    # the `models/plda/` blobs are compiled into the `diaric` dependency, not
+    # this crate, so this capture harness no longer exports them.
 
     # Summary
     print(f"[capture] raw_embeddings: {buf.raw_embeddings.shape}")

@@ -5,7 +5,7 @@
 
 #![cfg(all(feature = "ort", feature = "bundled-segmentation"))]
 
-use diarization::segment::{SegmentModel, SegmentOptions, Segmenter};
+use diarization::segment::{SegmentModel, SegmentOptions, Segmenter, SegmenterExt};
 
 #[test]
 #[ignore = "exercises ONNX runtime"]

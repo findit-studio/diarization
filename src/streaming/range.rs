@@ -6,9 +6,9 @@ use std::sync::Arc;
 use crate::{
   aggregate::try_count_pyannote,
   embed::EMBEDDING_DIM,
-  ops::spill::{SpillBytes, SpillOptions},
   reconstruct::SlidingWindow,
   segment::FRAMES_PER_WINDOW,
+  spill::{SpillBytes, SpillOptions},
 };
 
 /// Speaker slots per chunk (pyannote powerset = 3). Local copy for
