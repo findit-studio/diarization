@@ -52,6 +52,27 @@ pub enum Error {
   #[error("similarity_threshold ({0}) must be finite in [-1.0, 1.0]")]
   InvalidSimilarityThreshold(f32),
 
+  /// A field of `OnlineClusterOptions` is out of the range its setter
+  /// enforces. The `with_*` / `set_*` builders validate on the construction
+  /// path, but a `#[serde(default)]` deserialize bypasses them and can read an
+  /// out-of-range value straight into the struct. `OnlineClusterer::assign`
+  /// gates on `speaker_threshold` / `embedding_threshold` with strict `<`
+  /// against a cosine distance in `[0.0, 2.0]`, and on `min_speech_duration`
+  /// with `>=`; a threshold above the `2.0` ceiling makes it reuse a speaker
+  /// at a distance (e.g. antipodal `2.0`) that no validated configuration can
+  /// produce. `OnlineClusterer::try_new` surfaces this; `OnlineClusterer::new`
+  /// panics on it.
+  #[error("OnlineClusterOptions.{field} ({value}) is out of range: {constraint}")]
+  InvalidOnlineOption {
+    /// The offending option field (`speaker_threshold`,
+    /// `embedding_threshold`, or `min_speech_duration`).
+    field: &'static str,
+    /// The out-of-range value read from the deserialized config.
+    value: f32,
+    /// The violated constraint, e.g. `finite cosine distance in [0.0, 2.0]`.
+    constraint: &'static str,
+  },
+
   /// Offline clustering input exceeds the dense-method size cap.
   ///
   /// Spectral and full-pairwise agglomerative clustering allocate dense
