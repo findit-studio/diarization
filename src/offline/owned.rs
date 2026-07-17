@@ -36,6 +36,14 @@ use crate::{
   spill::SpillOptions,
 };
 
+// `min_duration_off` / `smoothing_epsilon` are validated against the single
+// diaric-owned authority — `OwnedPipelineOptions` forwards both into
+// `OfflineInput`, so accepting a value `diarize_offline` would later reject
+// is a drift bug. Call diaric's exposed predicates rather than re-deriving
+// the bounds. (`check_onset` stays local above: the onset knob only flows
+// through the audio entrypoints, which diaric's tensor path does not model.)
+use diaric::offline::{check_min_duration_off, check_smoothing_epsilon};
+
 /// Number of speaker slots per chunk. Pyannote `segmentation-3.0`
 /// trains on 3 simultaneous speakers (the 7 powerset classes).
 pub const SLOTS_PER_CHUNK: usize = 3;
@@ -53,36 +61,6 @@ pub(crate) const fn check_onset(v: f32) -> bool {
   #[allow(clippy::eq_op)] // intentional NaN check: NaN != NaN by IEEE 754.
   let not_nan = !(v != v);
   not_nan && v > 0.0 && v <= 1.0
-}
-
-/// `const fn` predicate: `v` is finite and `>= 0` (f64). Used for
-/// `min_duration_off`, a non-negative seconds quantity passed unchanged
-/// into RTTM span post-processing. A local copy of the predicate
-/// `diaric::offline::diarize_offline` enforces on the pure tensor path —
-/// mirroring the same small duplication `diaric`'s reconstruct module
-/// already keeps — exposed `pub(crate)` so `streaming::offline_diarizer`
-/// reuses it.
-#[inline]
-pub(crate) const fn check_min_duration_off(v: f64) -> bool {
-  #[allow(clippy::eq_op)] // intentional NaN check: NaN != NaN by IEEE 754.
-  let not_nan = !(v != v);
-  not_nan && v >= 0.0 && v != f64::INFINITY
-}
-
-/// `const fn` predicate: `v` is `None` or `Some(finite >= 0)` (f32). Used
-/// for the optional smoothing epsilon; `None` disables smoothing (bit-exact
-/// pyannote argmax) and is always valid. Local copy of the `diarize_offline`
-/// predicate, exposed `pub(crate)` for `streaming::offline_diarizer`.
-#[inline]
-pub(crate) const fn check_smoothing_epsilon(v: Option<f32>) -> bool {
-  match v {
-    None => true,
-    Some(x) => {
-      #[allow(clippy::eq_op)] // intentional NaN check: NaN != NaN by IEEE 754.
-      let not_nan = !(x != x);
-      not_nan && x >= 0.0 && x != f32::INFINITY
-    }
-  }
 }
 
 /// Configuration for [`OwnedDiarizationPipeline`].
@@ -803,6 +781,12 @@ mod option_validation_tests {
   }
 
   // ── min_duration_off / smoothing_epsilon validation ──────────────
+  //
+  // The predicates (`check_min_duration_off`, `check_smoothing_epsilon`)
+  // are owned by `diaric` and imported from `diaric::offline`. These
+  // contract guards pin that this crate validates against that single
+  // authority: a diaric bound change surfaces here rather than letting the
+  // preflight silently diverge from what `diarize_offline` enforces.
 
   #[test]
   fn check_min_duration_off_predicate() {

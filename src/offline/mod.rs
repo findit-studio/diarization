@@ -53,13 +53,19 @@ pub use diaric::offline::{OfflineInput, OfflineOutput, ShapeError, diarize_offli
 pub use owned::{OwnedDiarizationPipeline, OwnedPipelineOptions, SLOTS_PER_CHUNK};
 
 /// Reused by [`crate::streaming::offline_diarizer`] for the same
-/// onset / min_duration_off / smoothing_epsilon validation it
-/// performs on its [`OwnedPipelineOptions`]-derived config. These
-/// three predicates mirror the ones `diarize_offline` enforces on the
-/// pure tensor path (kept as small local copies alongside `check_onset`,
-/// which the onset knob only flows through on the audio entrypoints).
+/// onset / min_duration_off / smoothing_epsilon validation it performs on
+/// its [`OwnedPipelineOptions`]-derived config. `min_duration_off` and
+/// `smoothing_epsilon` are validated against the single diaric-owned
+/// authority ([`diaric::offline::check_min_duration_off`] /
+/// [`check_smoothing_epsilon`](diaric::offline::check_smoothing_epsilon)),
+/// so this crate's preflight cannot drift from what `diarize_offline`
+/// enforces on the pure tensor path. `check_onset` stays local: the onset
+/// knob only flows through the audio entrypoints, which diaric's tensor
+/// path does not model.
 #[cfg(feature = "ort")]
-pub(crate) use owned::{check_min_duration_off, check_onset, check_smoothing_epsilon};
+pub(crate) use diaric::offline::{check_min_duration_off, check_smoothing_epsilon};
+#[cfg(feature = "ort")]
+pub(crate) use owned::check_onset;
 
 /// Errors from the offline diarization pipeline.
 ///
