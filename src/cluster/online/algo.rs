@@ -6,9 +6,12 @@
 //! `Sources/FluidAudio/Diarizer/`. See the module doc ([`super`]) for the
 //! algorithm-class caveats (order-dependent, not pyannote-parity).
 
-use crate::embed::{EMBEDDING_DIM, Embedding};
+use crate::{
+  cluster::Error,
+  embed::{EMBEDDING_DIM, Embedding},
+};
 
-use super::options::OnlineClusterOptions;
+use super::options::{OnlineClusterOptions, duration_in_range, threshold_in_range};
 
 /// EMA blend weight for the centroid update — the `alpha` hard-wired at
 /// FluidAudio's update call site (`Clustering/SpeakerManager.swift:452`) and
@@ -124,12 +127,62 @@ impl Default for OnlineClusterer {
 
 impl OnlineClusterer {
   /// A fresh clusterer with no speakers and the given options.
+  ///
+  /// # Panics
+  /// Panics if any [`OnlineClusterOptions`] field is out of range: either
+  /// threshold non-finite or outside `[0.0, 2.0]`, or `min_speech_duration`
+  /// non-finite or negative. Defense-in-depth: the option setters already
+  /// enforce these invariants on the builder path, so this trip only fires
+  /// when the options were constructed without them — most realistically a
+  /// serde-deserialized config (`#[serde(default)]` fields are never validated
+  /// by the setters). Use [`Self::try_new`] to surface these preconditions as
+  /// a [`cluster::Error`](crate::cluster::Error) instead.
   pub fn new(options: OnlineClusterOptions) -> Self {
-    Self {
+    Self::try_new(options).expect("OnlineClusterer::new: invalid options; use try_new to handle")
+  }
+
+  /// Fallible variant of [`Self::new`]. Returns a
+  /// [`cluster::Error`](crate::cluster::Error) (`InvalidOnlineOption`) for any
+  /// of the range violations described on [`Self::new`]; otherwise identical
+  /// output.
+  ///
+  /// Validation happens once, at the construction boundary — the same
+  /// serde-bypass defense `Segmenter::try_new` and `cluster_offline` apply.
+  /// `OnlineClusterOptions` derives `Deserialize` with `#[serde(default)]`
+  /// fields, so a JSON/TOML config can carry a threshold above the `2.0`
+  /// cosine-distance ceiling (or a negative duration) that the `with_*` /
+  /// `set_*` setters would have rejected; left unchecked those values reach
+  /// [`assign`](Self::assign) and flip its strict-`<` / `>=` gates.
+  pub fn try_new(options: OnlineClusterOptions) -> Result<Self, Error> {
+    // Mirror the setter predicates exactly (the shared `threshold_in_range` /
+    // `duration_in_range`) so a serde-bypassed config is gated by the same
+    // rule the builder path enforces.
+    if !threshold_in_range(options.speaker_threshold()) {
+      return Err(Error::InvalidOnlineOption {
+        field: "speaker_threshold",
+        value: options.speaker_threshold(),
+        constraint: "finite cosine distance in [0.0, 2.0]",
+      });
+    }
+    if !threshold_in_range(options.embedding_threshold()) {
+      return Err(Error::InvalidOnlineOption {
+        field: "embedding_threshold",
+        value: options.embedding_threshold(),
+        constraint: "finite cosine distance in [0.0, 2.0]",
+      });
+    }
+    if !duration_in_range(options.min_speech_duration()) {
+      return Err(Error::InvalidOnlineOption {
+        field: "min_speech_duration",
+        value: options.min_speech_duration(),
+        constraint: "finite and >= 0.0 seconds",
+      });
+    }
+    Ok(Self {
       options,
       speakers: Vec::new(),
       next_id: 1,
-    }
+    })
   }
 
   /// The clusterer's options.

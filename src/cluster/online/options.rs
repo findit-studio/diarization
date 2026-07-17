@@ -30,13 +30,32 @@ pub const DEFAULT_MIN_SPEECH_DURATION: f32 = 1.0;
 /// real decision boundary.
 const MAX_THRESHOLD_DISTANCE: f32 = 2.0;
 
+/// Predicate for a valid cosine-distance threshold: finite and within
+/// `[0.0, MAX_THRESHOLD_DISTANCE]`. Shared so the panicking setters and the
+/// fallible [`OnlineClusterer::try_new`](super::OnlineClusterer::try_new)
+/// construction guard apply the *identical* rule — a serde-deserialized config
+/// that bypasses the setters is still checked against the same bound, with no
+/// second predicate to drift out of sync.
+#[inline]
+pub(crate) fn threshold_in_range(v: f32) -> bool {
+  v.is_finite() && (0.0..=MAX_THRESHOLD_DISTANCE).contains(&v)
+}
+
+/// Predicate for a valid minimum speech duration: finite and non-negative.
+/// Shared with [`OnlineClusterer::try_new`](super::OnlineClusterer::try_new)
+/// for the same reason as [`threshold_in_range`].
+#[inline]
+pub(crate) fn duration_in_range(v: f32) -> bool {
+  v.is_finite() && v >= 0.0
+}
+
 /// Range check shared by both threshold setters. Mirrors
 /// [`crate::cluster`]'s `OfflineClusterOptions` builder-panic idiom (an
 /// out-of-range knob is a caller bug, surfaced eagerly).
 #[inline]
 fn validate_threshold(v: f32) {
   assert!(
-    v.is_finite() && (0.0..=MAX_THRESHOLD_DISTANCE).contains(&v),
+    threshold_in_range(v),
     "threshold must be a finite cosine distance in [0.0, 2.0]; got {v}"
   );
 }
@@ -46,7 +65,7 @@ fn validate_threshold(v: f32) {
 #[inline]
 fn validate_duration(v: f32) {
   assert!(
-    v.is_finite() && v >= 0.0,
+    duration_in_range(v),
     "min_speech_duration must be finite and >= 0.0 seconds; got {v}"
   );
 }

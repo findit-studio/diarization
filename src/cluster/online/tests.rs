@@ -21,6 +21,16 @@ fn basis(i: usize) -> Embedding {
   Embedding::normalize_from(v).unwrap()
 }
 
+/// The antipode of [`basis`]`(i)`: `-eᵢ`, unit-norm, at cosine distance
+/// exactly `2.0` from `basis(i)` (dot `−1`, clamped, `1 − (−1)`). The maximum
+/// possible cosine distance — the value that makes the `speaker_threshold`
+/// ceiling load-bearing.
+fn neg_basis(i: usize) -> Embedding {
+  let mut v = [0.0f32; EMBEDDING_DIM];
+  v[i] = -1.0;
+  Embedding::normalize_from(v).unwrap()
+}
+
 /// Embedding with only dims 0 and 1 set, then L2-normalized.
 fn emb2(a: f32, b: f32) -> Embedding {
   let mut v = [0.0f32; EMBEDDING_DIM];
@@ -423,4 +433,130 @@ fn l2_normalize_epsilon_clamp_is_1e_minus_12() {
   let out = l2_normalize(&v);
   assert_eq!(out[0], 0.5);
   assert!(out[1..].iter().all(|&x| x == 0.0));
+}
+
+// ── Serde-bypass construction guard (L2) ─────────────────────────────────
+//
+// `OnlineClusterOptions` derives `Deserialize`; `#[serde(default)]` fills any
+// missing field but the `with_*`/`set_*` range checks are bypassed, so a JSON
+// blob can carry an out-of-range threshold straight into the struct.
+// `OnlineClusterer::try_new` re-validates every field at the construction
+// boundary (mirroring `Segmenter::try_new` / `cluster_offline`); `new` panics
+// on the same violation. The `serde`-gated tests below are the only way to
+// synthesize a bypassed `OnlineClusterOptions` in stable Rust — its fields are
+// private and the setters panic — so they are gated on the feature that
+// exercises the guard.
+
+/// The exact failing history from the finding: `speaker_threshold` 2.1 sits
+/// ABOVE the 2.0 cosine-distance ceiling. `try_new` must reject it.
+///
+/// Mutation-proof (delete the `speaker_threshold` guard in `try_new`):
+/// construction returns `Ok`, and the `Ok` arm here reproduces the finding —
+/// feeding `basis(0)` then its antipode reuses spk1 because the antipodal
+/// distance `2.0 < 2.1`, an `Existing(1)` no validated config can produce.
+/// That arm asserts `New(2)`, so the removed guard fails this test concretely.
+#[cfg(feature = "serde")]
+#[test]
+fn try_new_rejects_serde_bypassed_speaker_threshold() {
+  use crate::cluster::Error;
+  let opts: OnlineClusterOptions = serde_json::from_str(
+    r#"{"speaker_threshold":2.1,"embedding_threshold":0.0,"min_speech_duration":0.0}"#,
+  )
+  .expect("deserialize");
+  match OnlineClusterer::try_new(opts) {
+    Err(Error::InvalidOnlineOption { field, value, .. }) => {
+      assert_eq!(field, "speaker_threshold");
+      assert_eq!(value, 2.1);
+    }
+    Ok(mut c) => {
+      assert_eq!(c.assign(&basis(0), 2.0), Assignment::New(1));
+      assert_eq!(
+        c.assign(&neg_basis(0), 2.0),
+        Assignment::New(2),
+        "guard removed: antipodal distance 2.0 < 2.1 reused spk1 (Existing(1)) \
+         — the exact serde bypass this test pins"
+      );
+    }
+    Err(other) => panic!("expected InvalidOnlineOption, got {other:?}"),
+  }
+}
+
+/// `new` panics on the same bypassed config (mirrors `Segmenter::new`).
+/// Mutation-proof: remove the guard → `new` no longer panics → `should_panic`
+/// fails.
+#[cfg(feature = "serde")]
+#[test]
+#[should_panic(expected = "invalid options")]
+fn new_panics_on_serde_bypassed_speaker_threshold() {
+  let opts: OnlineClusterOptions = serde_json::from_str(
+    r#"{"speaker_threshold":2.1,"embedding_threshold":0.0,"min_speech_duration":0.0}"#,
+  )
+  .expect("deserialize");
+  let _ = OnlineClusterer::new(opts);
+}
+
+/// The second guarded field: an out-of-range `embedding_threshold` (2.5 > 2.0)
+/// is rejected and named. Mutation-proof: drop the `embedding_threshold` check
+/// → `try_new` returns `Ok` → the `other` arm panics.
+#[cfg(feature = "serde")]
+#[test]
+fn try_new_rejects_serde_bypassed_embedding_threshold() {
+  use crate::cluster::Error;
+  let opts: OnlineClusterOptions =
+    serde_json::from_str(r#"{"embedding_threshold":2.5}"#).expect("deserialize");
+  match OnlineClusterer::try_new(opts) {
+    Err(Error::InvalidOnlineOption { field, value, .. }) => {
+      assert_eq!(field, "embedding_threshold");
+      assert_eq!(value, 2.5);
+    }
+    other => panic!("expected InvalidOnlineOption, got {other:?}"),
+  }
+}
+
+/// The third guarded field: a negative `min_speech_duration` is rejected and
+/// named. Mutation-proof: drop the `min_speech_duration` check → `try_new`
+/// returns `Ok` → the `other` arm panics.
+#[cfg(feature = "serde")]
+#[test]
+fn try_new_rejects_serde_bypassed_min_speech_duration() {
+  use crate::cluster::Error;
+  let opts: OnlineClusterOptions =
+    serde_json::from_str(r#"{"min_speech_duration":-1.0}"#).expect("deserialize");
+  match OnlineClusterer::try_new(opts) {
+    Err(Error::InvalidOnlineOption { field, value, .. }) => {
+      assert_eq!(field, "min_speech_duration");
+      assert_eq!(value, -1.0);
+    }
+    other => panic!("expected InvalidOnlineOption, got {other:?}"),
+  }
+}
+
+/// A valid JSON config still round-trips and constructs: `try_new` returns
+/// `Ok` and the clusterer assigns normally. Guards against an over-eager guard
+/// that rejects in-range configs (which would make `.expect(...)` panic here).
+#[cfg(feature = "serde")]
+#[test]
+fn try_new_accepts_valid_serde_roundtrip() {
+  let opts: OnlineClusterOptions = serde_json::from_str(
+    r#"{"speaker_threshold":0.65,"embedding_threshold":0.45,"min_speech_duration":1.0}"#,
+  )
+  .expect("deserialize");
+  let mut c = OnlineClusterer::try_new(opts).expect("valid config must construct");
+  assert_eq!(c.assign(&basis(0), 2.0), Assignment::New(1));
+  assert_eq!(c.assign(&basis(0), 2.0), Assignment::Existing(1));
+}
+
+/// The boundary the finding pivots on, provable without serde: the *maximum
+/// valid* `speaker_threshold` (2.0) still SPAWNS a new speaker for an antipode,
+/// because the assignment gate is strict `<` and the antipodal distance is
+/// exactly 2.0 (`2.0 < 2.0` is false). No validated configuration can turn the
+/// antipode into `Existing`, which is exactly why the serde-bypassed 2.1 is a
+/// defect. Mutation-proof: assignment gate `<`→`<=` → the antipode reuses spk1
+/// (`Existing(1)`) → this test's `New(2)` fails.
+#[test]
+fn max_valid_speaker_threshold_spawns_on_antipode() {
+  let mut c = OnlineClusterer::new(opts(2.0, 0.0, 0.0));
+  assert_eq!(c.assign(&basis(0), 2.0), Assignment::New(1));
+  assert_eq!(c.assign(&neg_basis(0), 2.0), Assignment::New(2));
+  assert_eq!(c.speaker_count(), 2);
 }
