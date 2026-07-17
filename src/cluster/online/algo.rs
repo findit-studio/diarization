@@ -250,9 +250,15 @@ impl OnlineClusterer {
   ///      reject it: `l2Normalize` floors the norm at `1e-12`, so a zero vector
   ///      normalizes to all-zeros and STILL creates a speaker (with a zero
   ///      centroid — only its history entry is dropped by the `sumSquares >
-  ///      0.01` guard), and a sub-`1e-12` vector is *amplified* (e.g.
-  ///      `[5e-13, …] → [0.5, …]`) and seeds a speaker with that amplified
-  ///      centroid. dia's typed API forbids those states rather than
+  ///      0.01` guard), and a sub-`1e-12` vector is *amplified*
+  ///      (`[5e-13, …] → [0.5, …]` at `:147`) and STILL creates a speaker. But
+  ///      the create path normalizes a SECOND time (`createNewSpeaker`,
+  ///      `:469`), re-scaling that `[0.5, …]` to the unit `[1.0, …]`, so the
+  ///      stored centroid is `[1.0, …]`, not the amplified `[0.5, …]`. (The
+  ///      later re-normalizes preserve the now-unit vector: `Speaker.init`,
+  ///      `RawEmbedding.init`, `recalculateMainEmbedding` —
+  ///      `Clustering/SpeakerTypes.swift:48,215,159`.) dia's typed API forbids
+  ///      those states rather than
   ///      reproducing them; this is a restriction of the port's input domain,
   ///      not equivalent behavior.
   /// 2. Find the nearest existing centroid by cosine distance, strict-min
