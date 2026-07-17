@@ -6,12 +6,11 @@
 //! methods on `EmbedModel` (variable-length clips). They are `pub(crate)`
 //! because the public surface lives on `EmbedModel` itself.
 
-use crate::{
-  embed::{
-    EmbedModel, Error,
-    options::{EMBED_WINDOW_SAMPLES, EMBEDDING_DIM, HOP_SAMPLES, MIN_CLIP_SAMPLES, NORM_EPSILON},
-  },
-  ops,
+use diaric::{axpy_f32, embed::Error as EmbedCore};
+
+use crate::embed::{
+  EmbedModel, Error,
+  options::{EMBED_WINDOW_SAMPLES, EMBEDDING_DIM, HOP_SAMPLES, MIN_CLIP_SAMPLES, NORM_EPSILON},
 };
 
 /// Plan window starts for a clip of `len` samples (spec §5.1).
@@ -44,7 +43,7 @@ pub(crate) fn plan_starts(len: usize) -> Vec<usize> {
 /// Run inference on one full clip via the unweighted sliding-window-mean
 /// algorithm (spec §5.1).
 ///
-/// - `len < MIN_CLIP_SAMPLES`: returns [`Error::InvalidClip`].
+/// - `len < MIN_CLIP_SAMPLES`: returns [`EmbedCore::InvalidClip`].
 /// - `MIN_CLIP_SAMPLES <= len <= EMBED_WINDOW_SAMPLES`: single inference
 ///   on the zero-padded clip, returns `(raw, 1)`.
 /// - `len > EMBED_WINDOW_SAMPLES`: sums per-window raw outputs across the
@@ -52,16 +51,19 @@ pub(crate) fn plan_starts(len: usize) -> Vec<usize> {
 ///
 /// Returns the **unnormalized** sum. Caller L2-normalizes via
 /// [`Embedding::normalize_from`](crate::embed::Embedding::normalize_from)
-/// (which surfaces [`Error::DegenerateEmbedding`] on zero-norm).
+/// (which surfaces [`EmbedCore::DegenerateEmbedding`] on zero-norm).
 pub(crate) fn embed_unweighted(
   model: &mut EmbedModel,
   samples: &[f32],
 ) -> Result<([f32; EMBEDDING_DIM], u32), Error> {
   if samples.len() < MIN_CLIP_SAMPLES as usize {
-    return Err(Error::InvalidClip {
-      len: samples.len(),
-      min: MIN_CLIP_SAMPLES as usize,
-    });
+    return Err(
+      EmbedCore::InvalidClip {
+        len: samples.len(),
+        min: MIN_CLIP_SAMPLES as usize,
+      }
+      .into(),
+    );
   }
   // Backend-independent finite-input guard. ORT routes through
   // `compute_full_fbank` which rejects non-finite samples upfront,
@@ -70,7 +72,7 @@ pub(crate) fn embed_unweighted(
   // embedding that passes the post-output check. Mirrors the guard
   // already in `EmbedModel::embed_chunk_with_frame_mask`.
   if samples.iter().any(|v| !v.is_finite()) {
-    return Err(Error::NonFiniteInput);
+    return Err(EmbedCore::NonFiniteInput.into());
   }
   let mut sum = [0.0f32; EMBEDDING_DIM];
 
@@ -94,7 +96,7 @@ pub(crate) fn embed_unweighted(
   // `*s += r` chain, which doesn't propagate visibly through
   // L2-normalize / cosine clustering.
   for raw in &raws {
-    ops::axpy_f32(&mut sum, 1.0, raw.as_slice());
+    axpy_f32(&mut sum, 1.0, raw.as_slice());
   }
   Ok((sum, starts.len() as u32))
 }
@@ -108,9 +110,9 @@ pub(crate) fn embed_unweighted(
 /// step is equivalent).
 ///
 /// Errors:
-/// - [`Error::WeightShapeMismatch`] if `voice_probs.len() != samples.len()`.
-/// - [`Error::InvalidClip`] if `samples.len() < MIN_CLIP_SAMPLES`.
-/// - [`Error::AllSilent`] if the sum of per-window weights is below
+/// - [`EmbedCore::WeightShapeMismatch`] if `voice_probs.len() != samples.len()`.
+/// - [`EmbedCore::InvalidClip`] if `samples.len() < MIN_CLIP_SAMPLES`.
+/// - [`EmbedCore::AllSilent`] if the sum of per-window weights is below
 ///   [`NORM_EPSILON`] (no signal to aggregate).
 ///
 /// Returns `(weighted_sum, num_windows, total_weight)`.
@@ -120,22 +122,28 @@ pub(crate) fn embed_weighted_inner(
   voice_probs: &[f32],
 ) -> Result<([f32; EMBEDDING_DIM], u32, f32), Error> {
   if samples.len() != voice_probs.len() {
-    return Err(Error::WeightShapeMismatch {
-      samples_len: samples.len(),
-      weights_len: voice_probs.len(),
-    });
+    return Err(
+      EmbedCore::WeightShapeMismatch {
+        samples_len: samples.len(),
+        weights_len: voice_probs.len(),
+      }
+      .into(),
+    );
   }
   if samples.len() < MIN_CLIP_SAMPLES as usize {
-    return Err(Error::InvalidClip {
-      len: samples.len(),
-      min: MIN_CLIP_SAMPLES as usize,
-    });
+    return Err(
+      EmbedCore::InvalidClip {
+        len: samples.len(),
+        min: MIN_CLIP_SAMPLES as usize,
+      }
+      .into(),
+    );
   }
   // Backend-independent finite-input guard on samples (mirrors
   // `embed_unweighted`). tch backend forwards samples directly to
   // TorchScript without an upstream finite check.
   if samples.iter().any(|v| !v.is_finite()) {
-    return Err(Error::NonFiniteInput);
+    return Err(EmbedCore::NonFiniteInput.into());
   }
   // Voice-probability weights must be finite AND in [0, 1]. NaN
   // weights bypass the `total_weight < NORM_EPSILON` check (every
@@ -148,7 +156,7 @@ pub(crate) fn embed_weighted_inner(
     .iter()
     .any(|w| !w.is_finite() || *w < 0.0 || *w > 1.0)
   {
-    return Err(Error::InvalidVoiceProbs);
+    return Err(EmbedCore::InvalidVoiceProbs.into());
   }
 
   let mut sum = [0.0f32; EMBEDDING_DIM];
@@ -161,9 +169,9 @@ pub(crate) fn embed_weighted_inner(
     let raw = model.embed_audio_clip(&padded)?;
     let w: f32 = voice_probs.iter().sum::<f32>() / voice_probs.len() as f32;
     if w < NORM_EPSILON {
-      return Err(Error::AllSilent);
+      return Err(EmbedCore::AllSilent.into());
     }
-    ops::axpy_f32(&mut sum, w, raw.as_slice());
+    axpy_f32(&mut sum, w, raw.as_slice());
     return Ok((sum, 1, w));
   }
 
@@ -174,11 +182,11 @@ pub(crate) fn embed_weighted_inner(
   for (i, &start) in starts.iter().enumerate() {
     let weights = &voice_probs[start..start + win];
     let w: f32 = weights.iter().sum::<f32>() / win as f32;
-    ops::axpy_f32(&mut sum, w, raws[i].as_slice());
+    axpy_f32(&mut sum, w, raws[i].as_slice());
     total_weight += w;
   }
   if total_weight < NORM_EPSILON {
-    return Err(Error::AllSilent);
+    return Err(EmbedCore::AllSilent.into());
   }
   Ok((sum, starts.len() as u32, total_weight))
 }

@@ -1,31 +1,33 @@
-//! Speaker segmentation: Sans-I/O state machine + optional ort driver.
+//! Speaker segmentation: the `diaric` sans-I/O state machine + this
+//! crate's optional ONNX driver.
+//!
+//! The backend-free segmentation surface — the [`Segmenter`] sans-I/O
+//! windowing/hysteresis state machine, powerset decoding, the
+//! [`SegmentOptions`] config, and the value types — lives in
+//! `diaric::segment` and is re-exported here. This crate adds the ONNX
+//! segmentation model runner ([`SegmentModel`]).
 //!
 //! See the crate-level docs and `docs/superpowers/specs/` for the design.
 
 mod error;
-mod hysteresis;
-pub(crate) mod options;
-pub mod powerset;
-mod segmenter;
-pub(crate) mod stitch;
-mod types;
-mod window;
 
 #[cfg(feature = "ort")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ort")))]
 mod model;
 
 pub use error::Error;
-pub use options::{
-  FRAMES_PER_WINDOW, MAX_SPEAKER_SLOTS, POWERSET_CLASSES, PYANNOTE_FRAME_DURATION_S,
-  PYANNOTE_FRAME_STEP_S, SAMPLE_RATE_HZ, SAMPLE_RATE_TB, SegmentOptions, WINDOW_SAMPLES,
+
+// Backend-free segmentation surface, re-exported from `diaric::segment`
+// so `diarization::segment::*` keeps resolving.
+pub use diaric::segment::{
+  Action, Event, FRAMES_PER_WINDOW, MAX_SPEAKER_SLOTS, POWERSET_CLASSES, PYANNOTE_FRAME_DURATION_S,
+  PYANNOTE_FRAME_STEP_S, SAMPLE_RATE_HZ, SAMPLE_RATE_TB, SegmentOptions, Segmenter,
+  SpeakerActivity, WINDOW_SAMPLES, WindowId, powerset,
 };
-pub use segmenter::Segmenter;
-pub use types::{Action, Event, SpeakerActivity, WindowId};
 
 #[cfg(feature = "ort")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ort")))]
-pub use model::{SegmentModel, SegmentModelOptions};
+pub use model::{SegmentModel, SegmentModelOptions, SegmenterExt};
 
 #[cfg(feature = "ort")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ort")))]

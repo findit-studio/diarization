@@ -1,5 +1,12 @@
-//! Speaker fingerprint generation: WeSpeaker ResNet34 ONNX wrapper +
-//! kaldi-compatible fbank + sliding-window mean for variable-length clips.
+//! Speaker fingerprint generation: WeSpeaker ResNet34 ONNX/Torch runner
+//! over the `diaric` embedding value types + kaldi-compatible fbank.
+//!
+//! The backend-free half of the embedding pipeline — the [`Embedding`]
+//! value types, the [`cosine_similarity`] helper, the kaldi-fbank feature
+//! extractor ([`compute_fbank`], [`compute_full_fbank`]), and the
+//! pyannote geometry constants — lives in `diaric::embed` and is
+//! re-exported here. This crate adds the ONNX/Torch model runner
+//! ([`EmbedModel`]) and its option builder ([`EmbedModelOptions`]).
 //!
 //! See the crate-level docs and `docs/superpowers/specs/` for the design.
 //! Layered API:
@@ -15,14 +22,11 @@
 #[cfg(any(feature = "ort", feature = "tch"))]
 mod embedder;
 mod error;
-mod fbank;
 #[cfg(any(feature = "ort", feature = "tch"))]
 mod model;
 mod options;
-mod types;
 
 pub use error::Error;
-pub use fbank::{compute_fbank, compute_full_fbank};
 #[cfg(any(feature = "ort", feature = "tch"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "ort", feature = "tch"))))]
 pub use model::EmbedModel;
@@ -31,11 +35,17 @@ pub use model::EmbedModel;
 #[cfg(feature = "ort")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ort")))]
 pub use options::EmbedModelOptions;
+// The pyannote geometry constants live in `diaric::embed`; re-exported
+// through `options` (see `options.rs`) so the ort/tch runners can keep
+// referencing `crate::embed::options::*`.
 pub use options::{
   EMBED_WINDOW_SAMPLES, EMBEDDING_DIM, FBANK_FRAMES, FBANK_NUM_MELS, HOP_SAMPLES, MIN_CLIP_SAMPLES,
   NORM_EPSILON, SAMPLE_RATE_HZ,
 };
-pub use types::{Embedding, EmbeddingMeta, EmbeddingResult, cosine_similarity};
+// Backend-free embedding value types + the kaldi-fbank DSP, from `diaric`.
+pub use diaric::embed::{
+  Embedding, EmbeddingMeta, EmbeddingResult, compute_fbank, compute_full_fbank, cosine_similarity,
+};
 
 // Compile-time trait assertions. Catches a future field-type change that
 // would silently regress Send/Sync auto-derive on the public types.

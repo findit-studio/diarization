@@ -53,7 +53,6 @@ use crate::{
   aggregate::try_count_pyannote,
   embed::{EMBEDDING_DIM, EmbedModel},
   offline::{OfflineInput, OwnedPipelineOptions, diarize_offline},
-  ops::spill::SpillOptions,
   plda::PldaTransform,
   reconstruct::{
     ReconstructInput, RttmSpan, SlidingWindow, discrete_to_spans, reconstruct as reconstruct_grid,
@@ -63,6 +62,7 @@ use crate::{
     SAMPLE_RATE_HZ, SegmentModel, WINDOW_SAMPLES,
     powerset::{powerset_to_speakers_hard, softmax_row},
   },
+  spill::SpillOptions,
   streaming::RangeEmbeddings,
 };
 
@@ -99,13 +99,13 @@ pub enum StreamingError {
   /// through the infallible `count_pyannote` wrapper.
   #[error("streaming: aggregate: {0}")]
   Aggregate(#[from] crate::aggregate::Error),
-  /// Propagated from `crate::ops::spill::SpillBytesMut::zeros` when the
+  /// Propagated from `crate::spill::SpillBytesMut::zeros` when the
   /// per-range or concatenated scratch buffers cannot be allocated.
   /// At multi-hour scale these cross the 64 MiB default threshold
   /// and route through the file-backed mmap path; this surfaces
   /// tempfile / mmap failures from a `Result`-returning API.
   #[error("streaming: spill: {0}")]
-  Spill(#[from] crate::ops::spill::SpillError),
+  Spill(#[from] crate::spill::SpillError),
 }
 
 /// Specific shape-violation reasons for [`StreamingError::Shape`].
@@ -506,10 +506,8 @@ pub(crate) fn build_range(
       num_chunks,
       what: "segmentations",
     })?;
-  let mut segmentations = crate::ops::spill::SpillBytesMut::<f64>::zeros(
-    segs_len,
-    options.diarization().spill_options(),
-  )?;
+  let mut segmentations =
+    crate::spill::SpillBytesMut::<f64>::zeros(segs_len, options.diarization().spill_options())?;
   {
     let segs = segmentations.as_mut_slice();
 
@@ -553,7 +551,7 @@ pub(crate) fn build_range(
       what: "raw_embeddings",
     })?;
   let mut raw_embeddings =
-    crate::ops::spill::SpillBytesMut::<f32>::zeros(emb_len, options.diarization().spill_options())?;
+    crate::spill::SpillBytesMut::<f32>::zeros(emb_len, options.diarization().spill_options())?;
   {
     let segs = segmentations.as_mut_slice();
     let embs = raw_embeddings.as_mut_slice();
@@ -586,8 +584,8 @@ pub(crate) fn build_range(
 
         let raw = match embed_model.embed_chunk_with_frame_mask(&padded_chunk, &frame_mask) {
           Ok(v) => v,
-          Err(crate::embed::Error::InvalidClip { .. })
-          | Err(crate::embed::Error::DegenerateEmbedding) => {
+          Err(crate::embed::Error::Core(diaric::embed::Error::InvalidClip { .. }))
+          | Err(crate::embed::Error::Core(diaric::embed::Error::DegenerateEmbedding)) => {
             for f in 0..FRAMES_PER_WINDOW {
               segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s] = 0.0;
             }
@@ -602,7 +600,7 @@ pub(crate) fn build_range(
         if raw.iter().any(|v| !v.is_finite()) {
           return Err(StreamingError::Embed(format!(
             "{}",
-            crate::embed::Error::NonFiniteOutput
+            diaric::embed::Error::NonFiniteOutput
           )));
         }
         let norm_sq: f64 = raw.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
@@ -718,8 +716,8 @@ pub(crate) fn cluster_ranges_inner(
     .ok_or(StreamingShapeError::TotalShapeOverflow {
       what: "raw_embeddings",
     })?;
-  let mut all_segs = crate::ops::spill::SpillBytesMut::<f64>::zeros(total_segs_len, spill)?;
-  let mut all_emb = crate::ops::spill::SpillBytesMut::<f32>::zeros(total_emb_len, spill)?;
+  let mut all_segs = crate::spill::SpillBytesMut::<f64>::zeros(total_segs_len, spill)?;
+  let mut all_emb = crate::spill::SpillBytesMut::<f32>::zeros(total_emb_len, spill)?;
   {
     let segs = all_segs.as_mut_slice();
     let embs = all_emb.as_mut_slice();
@@ -746,7 +744,7 @@ pub(crate) fn cluster_ranges_inner(
         what: "output_frames",
       })
   })?;
-  let mut all_count = crate::ops::spill::SpillBytesMut::<u8>::zeros(total_output_frames, spill)?;
+  let mut all_count = crate::spill::SpillBytesMut::<u8>::zeros(total_output_frames, spill)?;
   {
     let buf = all_count.as_mut_slice();
     let mut off = 0;
@@ -787,7 +785,7 @@ pub(crate) fn cluster_ranges_inner(
   .with_min_duration_off(cfg.min_duration_off())
   .with_smoothing_epsilon(cfg.smoothing_epsilon())
   .with_spill_options(spill.clone());
-  let offline_out = diarize_offline(&input)?;
+  let offline_out = diarize_offline(&input).map_err(crate::offline::Error::Core)?;
   let hard_clusters = offline_out.hard_clusters();
   debug_assert_eq!(hard_clusters.len(), total_chunks);
 

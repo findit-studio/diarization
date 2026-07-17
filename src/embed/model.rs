@@ -24,11 +24,12 @@
 use core::time::Duration;
 use std::path::Path;
 
+use diaric::embed::Error as EmbedCore;
+
 use crate::embed::{
-  Error,
+  Embedding, EmbeddingMeta, EmbeddingResult, Error,
   embedder::{embed_unweighted, embed_weighted_inner},
   options::{EMBEDDING_DIM, MIN_CLIP_SAMPLES, SAMPLE_RATE_HZ},
-  types::{Embedding, EmbeddingMeta, EmbeddingResult},
 };
 // `FBANK_FRAMES` and `FBANK_NUM_MELS` are only consumed inside the
 // `#[cfg(feature = "ort")]` backend. Importing them unconditionally
@@ -104,10 +105,13 @@ pub(crate) trait EmbedBackend: Send {
     let total_samples = chunk_samples.len();
     let frame_count = frame_mask.len();
     if frame_count == 0 {
-      return Err(Error::InvalidClip {
-        len: 0,
-        min: MIN_CLIP_SAMPLES as usize,
-      });
+      return Err(
+        EmbedCore::InvalidClip {
+          len: 0,
+          min: MIN_CLIP_SAMPLES as usize,
+        }
+        .into(),
+      );
     }
 
     // Build per-sample mask from per-frame mask, then GATHER active
@@ -132,10 +136,13 @@ pub(crate) trait EmbedBackend: Send {
       .filter_map(|(&s, &keep)| keep.then_some(s))
       .collect();
     if gathered.len() < MIN_CLIP_SAMPLES as usize {
-      return Err(Error::InvalidClip {
-        len: gathered.len(),
-        min: MIN_CLIP_SAMPLES as usize,
-      });
+      return Err(
+        EmbedCore::InvalidClip {
+          len: gathered.len(),
+          min: MIN_CLIP_SAMPLES as usize,
+        }
+        .into(),
+      );
     }
 
     let win = EMBED_WINDOW_SAMPLES as usize;
@@ -169,7 +176,7 @@ pub(crate) trait EmbedBackend: Send {
 #[cfg(feature = "ort")]
 mod ort_backend {
   use super::*;
-  use crate::embed::fbank::compute_fbank;
+  use crate::embed::compute_fbank;
   use ort::{session::Session as OrtSession, value::TensorRef};
 
   pub(crate) struct OrtBackend {
@@ -231,10 +238,13 @@ mod ort_backend {
     }
     let expected = n * EMBEDDING_DIM;
     if data.len() != expected {
-      return Err(Error::InferenceShapeMismatch {
-        expected,
-        got: data.len(),
-      });
+      return Err(
+        EmbedCore::InferenceShapeMismatch {
+          expected,
+          got: data.len(),
+        }
+        .into(),
+      );
     }
     Ok(
       data
@@ -290,7 +300,7 @@ mod ort_backend {
       // resnet+pool with frame_mask as weights → embedding. We
       // compute the fbank in Rust (kaldi-native-fbank) since
       // torchaudio's kaldi.fbank doesn't export to ONNX.
-      use crate::embed::fbank::compute_full_fbank;
+      use crate::embed::compute_full_fbank;
       let fbank = compute_full_fbank(chunk_samples)?;
       let num_frames = fbank.len() / FBANK_NUM_MELS;
       let weights_flat: Vec<f32> = frame_mask
@@ -347,10 +357,13 @@ mod tch_backend {
         let output = self.module.forward_ts(&[input, weights])?;
         let expected_shape = [1_i64, EMBEDDING_DIM as i64];
         if output.size() != expected_shape {
-          return Err(Error::InferenceShapeMismatch {
-            expected: EMBEDDING_DIM,
-            got: output.numel(),
-          });
+          return Err(
+            EmbedCore::InferenceShapeMismatch {
+              expected: EMBEDDING_DIM,
+              got: output.numel(),
+            }
+            .into(),
+          );
         }
         let mut row = [0.0_f32; EMBEDDING_DIM];
         output.copy_data(&mut row, EMBEDDING_DIM);
@@ -379,10 +392,13 @@ mod tch_backend {
       let output = self.module.forward_ts(&[input, weights])?;
       let expected_shape = [1_i64, EMBEDDING_DIM as i64];
       if output.size() != expected_shape {
-        return Err(Error::InferenceShapeMismatch {
-          expected: EMBEDDING_DIM,
-          got: output.numel(),
-        });
+        return Err(
+          EmbedCore::InferenceShapeMismatch {
+            expected: EMBEDDING_DIM,
+            got: output.numel(),
+          }
+          .into(),
+        );
       }
       let mut row = [0.0_f32; EMBEDDING_DIM];
       output.copy_data(&mut row, EMBEDDING_DIM);
@@ -569,7 +585,7 @@ impl EmbedModel {
       .pop()
       .expect("backend returned a non-empty batch for n=1 input");
     if raw.iter().any(|v| !v.is_finite()) {
-      return Err(Error::NonFiniteOutput);
+      return Err(EmbedCore::NonFiniteOutput.into());
     }
     Ok(raw)
   }
@@ -590,7 +606,7 @@ impl EmbedModel {
     // normalize and feed PLDA/clustering as a "valid" speaker vector.
     for raw in raws.iter() {
       if raw.iter().any(|v| !v.is_finite()) {
-        return Err(Error::NonFiniteOutput);
+        return Err(EmbedCore::NonFiniteOutput.into());
       }
     }
     Ok(raws)
@@ -629,23 +645,29 @@ impl EmbedModel {
     // corrupts downstream PLDA/clustering.
     let expected_samples = crate::segment::WINDOW_SAMPLES as usize;
     if chunk_samples.len() != expected_samples {
-      return Err(Error::ChunkSamplesShapeMismatch {
-        expected: expected_samples,
-        got: chunk_samples.len(),
-      });
+      return Err(
+        EmbedCore::ChunkSamplesShapeMismatch {
+          expected: expected_samples,
+          got: chunk_samples.len(),
+        }
+        .into(),
+      );
     }
     let expected_frames = crate::segment::FRAMES_PER_WINDOW;
     if frame_mask.len() != expected_frames {
-      return Err(Error::FrameMaskShapeMismatch {
-        expected: expected_frames,
-        got: frame_mask.len(),
-      });
+      return Err(
+        EmbedCore::FrameMaskShapeMismatch {
+          expected: expected_frames,
+          got: frame_mask.len(),
+        }
+        .into(),
+      );
     }
     // Empty/all-false mask → all-zero pooling weights →
     // division-by-zero in statistics pooling → NaN/inf row. Reject
     // before backend dispatch.
     if !frame_mask.iter().any(|&b| b) {
-      return Err(Error::EmptyOrInactiveMask);
+      return Err(EmbedCore::EmptyOrInactiveMask.into());
     }
     // Backend-independent finite-input guard. ORT routes through
     // `compute_full_fbank`, which itself rejects non-finite samples
@@ -655,13 +677,13 @@ impl EmbedModel {
     // the post-output check) or surfaces as a backend-specific error.
     // Reject at the boundary so both backends behave identically.
     if chunk_samples.iter().any(|v| !v.is_finite()) {
-      return Err(Error::NonFiniteInput);
+      return Err(EmbedCore::NonFiniteInput.into());
     }
     let raw = self
       .backend
       .embed_chunk_with_frame_mask(chunk_samples, frame_mask)?;
     if raw.iter().any(|v| !v.is_finite()) {
-      return Err(Error::NonFiniteOutput);
+      return Err(EmbedCore::NonFiniteOutput.into());
     }
     Ok(raw)
   }
@@ -675,8 +697,8 @@ impl EmbedModel {
   /// window inference and aggregates via per-window unweighted sum, then
   /// L2-normalizes the result.
   ///
-  /// Returns [`Error::InvalidClip`] if `samples.len() < MIN_CLIP_SAMPLES`,
-  /// or [`Error::DegenerateEmbedding`] if the aggregated sum has near-zero
+  /// Returns [`EmbedCore::InvalidClip`] if `samples.len() < MIN_CLIP_SAMPLES`,
+  /// or [`EmbedCore::DegenerateEmbedding`] if the aggregated sum has near-zero
   /// L2 norm (effectively unreachable on real audio; signals caller bug).
   pub fn embed(&mut self, samples: &[f32]) -> Result<EmbeddingResult, Error> {
     self.embed_with_meta(samples, EmbeddingMeta::default())
@@ -690,7 +712,8 @@ impl EmbedModel {
     meta: EmbeddingMeta<A, T>,
   ) -> Result<EmbeddingResult<A, T>, Error> {
     let (sum, windows_used) = embed_unweighted(self, samples)?;
-    let embedding = Embedding::normalize_from(sum).ok_or(Error::DegenerateEmbedding)?;
+    let embedding =
+      Embedding::normalize_from(sum).ok_or_else(|| Error::Core(EmbedCore::DegenerateEmbedding))?;
     let duration = duration_from_samples(samples.len());
     Ok(EmbeddingResult::new(
       embedding,
@@ -707,10 +730,10 @@ impl EmbedModel {
   /// Aggregates per-window outputs as a weighted sum, then L2-normalizes.
   ///
   /// Errors:
-  /// - [`Error::WeightShapeMismatch`] if `voice_probs.len() != samples.len()`.
-  /// - [`Error::InvalidClip`] if `samples.len() < MIN_CLIP_SAMPLES`.
-  /// - [`Error::AllSilent`] if every per-window weight is below `NORM_EPSILON`.
-  /// - [`Error::DegenerateEmbedding`] if the weighted sum has near-zero norm.
+  /// - [`EmbedCore::WeightShapeMismatch`] if `voice_probs.len() != samples.len()`.
+  /// - [`EmbedCore::InvalidClip`] if `samples.len() < MIN_CLIP_SAMPLES`.
+  /// - [`EmbedCore::AllSilent`] if every per-window weight is below `NORM_EPSILON`.
+  /// - [`EmbedCore::DegenerateEmbedding`] if the weighted sum has near-zero norm.
   pub fn embed_weighted(
     &mut self,
     samples: &[f32],
@@ -727,13 +750,17 @@ impl EmbedModel {
     meta: EmbeddingMeta<A, T>,
   ) -> Result<EmbeddingResult<A, T>, Error> {
     if voice_probs.len() != samples.len() {
-      return Err(Error::WeightShapeMismatch {
-        samples_len: samples.len(),
-        weights_len: voice_probs.len(),
-      });
+      return Err(
+        EmbedCore::WeightShapeMismatch {
+          samples_len: samples.len(),
+          weights_len: voice_probs.len(),
+        }
+        .into(),
+      );
     }
     let (sum, windows_used, weight_sum) = embed_weighted_inner(self, samples, voice_probs)?;
-    let embedding = Embedding::normalize_from(sum).ok_or(Error::DegenerateEmbedding)?;
+    let embedding =
+      Embedding::normalize_from(sum).ok_or_else(|| Error::Core(EmbedCore::DegenerateEmbedding))?;
     let duration = duration_from_samples(samples.len());
     Ok(EmbeddingResult::new(
       embedding,
@@ -767,10 +794,13 @@ impl EmbedModel {
     keep_mask: &[bool],
   ) -> Result<[f32; EMBEDDING_DIM], Error> {
     if keep_mask.len() != samples.len() {
-      return Err(Error::MaskShapeMismatch {
-        samples_len: samples.len(),
-        mask_len: keep_mask.len(),
-      });
+      return Err(
+        EmbedCore::MaskShapeMismatch {
+          samples_len: samples.len(),
+          mask_len: keep_mask.len(),
+        }
+        .into(),
+      );
     }
     // Validate the FULL input slice for non-finite values before
     // gathering. Without this check, a NaN/inf at a masked-out
@@ -779,7 +809,7 @@ impl EmbedModel {
     // mask upstream buffer corruption that callers using
     // `Error::NonFiniteInput` as a quarantine signal need to see.
     if samples.iter().any(|v| !v.is_finite()) {
-      return Err(Error::NonFiniteInput);
+      return Err(EmbedCore::NonFiniteInput.into());
     }
     let gathered: Vec<f32> = samples
       .iter()
@@ -787,10 +817,13 @@ impl EmbedModel {
       .filter_map(|(&s, &keep)| keep.then_some(s))
       .collect();
     if gathered.len() < MIN_CLIP_SAMPLES as usize {
-      return Err(Error::InvalidClip {
-        len: gathered.len(),
-        min: MIN_CLIP_SAMPLES as usize,
-      });
+      return Err(
+        EmbedCore::InvalidClip {
+          len: gathered.len(),
+          min: MIN_CLIP_SAMPLES as usize,
+        }
+        .into(),
+      );
     }
     let (sum, _windows_used) = embed_unweighted(self, &gathered)?;
     Ok(sum)
@@ -804,16 +837,19 @@ impl EmbedModel {
     meta: EmbeddingMeta<A, T>,
   ) -> Result<EmbeddingResult<A, T>, Error> {
     if keep_mask.len() != samples.len() {
-      return Err(Error::MaskShapeMismatch {
-        samples_len: samples.len(),
-        mask_len: keep_mask.len(),
-      });
+      return Err(
+        EmbedCore::MaskShapeMismatch {
+          samples_len: samples.len(),
+          mask_len: keep_mask.len(),
+        }
+        .into(),
+      );
     }
     // Same full-slice finite check as `embed_masked_raw` — masked-out
     // NaN/inf would otherwise be filtered before `embed_unweighted`
     // sees them.
     if samples.iter().any(|v| !v.is_finite()) {
-      return Err(Error::NonFiniteInput);
+      return Err(EmbedCore::NonFiniteInput.into());
     }
     let gathered: Vec<f32> = samples
       .iter()
@@ -821,13 +857,17 @@ impl EmbedModel {
       .filter_map(|(&s, &keep)| keep.then_some(s))
       .collect();
     if gathered.len() < MIN_CLIP_SAMPLES as usize {
-      return Err(Error::InvalidClip {
-        len: gathered.len(),
-        min: MIN_CLIP_SAMPLES as usize,
-      });
+      return Err(
+        EmbedCore::InvalidClip {
+          len: gathered.len(),
+          min: MIN_CLIP_SAMPLES as usize,
+        }
+        .into(),
+      );
     }
     let (sum, windows_used) = embed_unweighted(self, &gathered)?;
-    let embedding = Embedding::normalize_from(sum).ok_or(Error::DegenerateEmbedding)?;
+    let embedding =
+      Embedding::normalize_from(sum).ok_or_else(|| Error::Core(EmbedCore::DegenerateEmbedding))?;
     let duration = duration_from_samples(gathered.len());
     Ok(EmbeddingResult::new(
       embedding,
@@ -933,10 +973,10 @@ mod tests {
     let r = model.embed_weighted(&samples, &probs);
     assert!(matches!(
       r,
-      Err(Error::WeightShapeMismatch {
+      Err(Error::Core(EmbedCore::WeightShapeMismatch {
         samples_len: 32_000,
         weights_len: 31_999,
-      })
+      }))
     ));
   }
 
@@ -954,7 +994,10 @@ mod tests {
       *m = true;
     }
     let r = model.embed_masked(&samples, &mask);
-    assert!(matches!(r, Err(Error::InvalidClip { len: 100, min: 400 })));
+    assert!(matches!(
+      r,
+      Err(Error::Core(EmbedCore::InvalidClip { len: 100, min: 400 }))
+    ));
   }
 
   /// `EmbedModel::embed_chunk_with_frame_mask` rejects a wrong-length
@@ -977,7 +1020,10 @@ mod tests {
     let mask = vec![true; crate::segment::FRAMES_PER_WINDOW];
     let r = model.embed_chunk_with_frame_mask(&samples, &mask);
     assert!(
-      matches!(r, Err(Error::ChunkSamplesShapeMismatch { .. })),
+      matches!(
+        r,
+        Err(Error::Core(EmbedCore::ChunkSamplesShapeMismatch { .. }))
+      ),
       "got {r:?}"
     );
   }
@@ -999,7 +1045,10 @@ mod tests {
     let mask = vec![true; crate::segment::FRAMES_PER_WINDOW - 1];
     let r = model.embed_chunk_with_frame_mask(&samples, &mask);
     assert!(
-      matches!(r, Err(Error::FrameMaskShapeMismatch { .. })),
+      matches!(
+        r,
+        Err(Error::Core(EmbedCore::FrameMaskShapeMismatch { .. }))
+      ),
       "got {r:?}"
     );
   }
@@ -1018,7 +1067,10 @@ mod tests {
     let mask: Vec<bool> = Vec::new();
     let r = model.embed_chunk_with_frame_mask(&samples, &mask);
     assert!(
-      matches!(r, Err(Error::FrameMaskShapeMismatch { .. })),
+      matches!(
+        r,
+        Err(Error::Core(EmbedCore::FrameMaskShapeMismatch { .. }))
+      ),
       "got {r:?}"
     );
   }
@@ -1038,7 +1090,10 @@ mod tests {
     let samples = vec![0.001f32; crate::segment::WINDOW_SAMPLES as usize];
     let mask = vec![false; crate::segment::FRAMES_PER_WINDOW];
     let r = model.embed_chunk_with_frame_mask(&samples, &mask);
-    assert!(matches!(r, Err(Error::EmptyOrInactiveMask)), "got {r:?}");
+    assert!(
+      matches!(r, Err(Error::Core(EmbedCore::EmptyOrInactiveMask))),
+      "got {r:?}"
+    );
   }
 
   /// NaN/inf samples must be rejected at the public boundary, before
@@ -1059,15 +1114,24 @@ mod tests {
     samples[42] = f32::NAN;
     let mask = vec![true; crate::segment::FRAMES_PER_WINDOW];
     let r = model.embed_chunk_with_frame_mask(&samples, &mask);
-    assert!(matches!(r, Err(Error::NonFiniteInput)), "got {r:?}");
+    assert!(
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
+      "got {r:?}"
+    );
 
     samples[42] = f32::INFINITY;
     let r = model.embed_chunk_with_frame_mask(&samples, &mask);
-    assert!(matches!(r, Err(Error::NonFiniteInput)), "got {r:?}");
+    assert!(
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
+      "got {r:?}"
+    );
 
     samples[42] = f32::NEG_INFINITY;
     let r = model.embed_chunk_with_frame_mask(&samples, &mask);
-    assert!(matches!(r, Err(Error::NonFiniteInput)), "got {r:?}");
+    assert!(
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
+      "got {r:?}"
+    );
   }
 
   /// `embed`/`embed_with_meta` (high-level entry points routed through
@@ -1087,11 +1151,17 @@ mod tests {
     let mut samples = vec![0.001f32; EMBED_WINDOW_SAMPLES as usize];
     samples[100] = f32::NAN;
     let r = model.embed(&samples);
-    assert!(matches!(r, Err(Error::NonFiniteInput)), "got {r:?}");
+    assert!(
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
+      "got {r:?}"
+    );
 
     samples[100] = f32::INFINITY;
     let r = model.embed(&samples);
-    assert!(matches!(r, Err(Error::NonFiniteInput)), "got {r:?}");
+    assert!(
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
+      "got {r:?}"
+    );
   }
 
   /// `embed_weighted` must reject non-finite samples and voice_probs
@@ -1112,18 +1182,24 @@ mod tests {
     let mut probs = vec![0.5f32; samples.len()];
     probs[200] = f32::NAN;
     let r = model.embed_weighted(&samples, &probs);
-    assert!(matches!(r, Err(Error::InvalidVoiceProbs)), "NaN: got {r:?}");
+    assert!(
+      matches!(r, Err(Error::Core(EmbedCore::InvalidVoiceProbs))),
+      "NaN: got {r:?}"
+    );
 
     // Negative weight.
     probs[200] = -0.1;
     let r = model.embed_weighted(&samples, &probs);
-    assert!(matches!(r, Err(Error::InvalidVoiceProbs)), "neg: got {r:?}");
+    assert!(
+      matches!(r, Err(Error::Core(EmbedCore::InvalidVoiceProbs))),
+      "neg: got {r:?}"
+    );
 
     // > 1 weight.
     probs[200] = 1.5;
     let r = model.embed_weighted(&samples, &probs);
     assert!(
-      matches!(r, Err(Error::InvalidVoiceProbs)),
+      matches!(r, Err(Error::Core(EmbedCore::InvalidVoiceProbs))),
       "above 1: got {r:?}"
     );
 
@@ -1131,7 +1207,7 @@ mod tests {
     probs[200] = f32::INFINITY;
     let r = model.embed_weighted(&samples, &probs);
     assert!(
-      matches!(r, Err(Error::InvalidVoiceProbs)),
+      matches!(r, Err(Error::Core(EmbedCore::InvalidVoiceProbs))),
       "+inf: got {r:?}"
     );
 
@@ -1141,12 +1217,12 @@ mod tests {
     bad_samples[100] = f32::NAN;
     let r = model.embed_weighted(&bad_samples, &probs);
     assert!(
-      matches!(r, Err(Error::NonFiniteInput)),
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
       "NaN sample: got {r:?}"
     );
   }
 
-  /// `embed_weighted` must surface [`Error::AllSilent`] when every
+  /// `embed_weighted` must surface [`EmbedCore::AllSilent`] when every
   /// per-window weight is below `NORM_EPSILON`. Without this guard,
   /// the post-aggregation L2 normalize would either divide by ~0
   /// (`DegenerateEmbedding`) or pass a noise-floor unit vector
@@ -1171,7 +1247,7 @@ mod tests {
     let probs = vec![0.0f32; samples.len()];
     let r = model.embed_weighted(&samples, &probs);
     assert!(
-      matches!(r, Err(Error::AllSilent)),
+      matches!(r, Err(Error::Core(EmbedCore::AllSilent))),
       "single-window all-zero weights must surface AllSilent, got {r:?}"
     );
 
@@ -1180,7 +1256,7 @@ mod tests {
     let probs = vec![0.0f32; samples.len()];
     let r = model.embed_weighted(&samples, &probs);
     assert!(
-      matches!(r, Err(Error::AllSilent)),
+      matches!(r, Err(Error::Core(EmbedCore::AllSilent))),
       "multi-window all-zero weights must surface AllSilent, got {r:?}"
     );
 
@@ -1191,7 +1267,7 @@ mod tests {
     let probs = vec![1e-15f32; samples.len()];
     let r = model.embed_weighted(&samples, &probs);
     assert!(
-      matches!(r, Err(Error::AllSilent)),
+      matches!(r, Err(Error::Core(EmbedCore::AllSilent))),
       "sub-epsilon weights must surface AllSilent, got {r:?}"
     );
   }
@@ -1222,13 +1298,13 @@ mod tests {
 
     let r = model.embed_masked_raw(&samples, &mask);
     assert!(
-      matches!(r, Err(Error::NonFiniteInput)),
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
       "embed_masked_raw must reject NaN at masked-out position: got {r:?}"
     );
 
     let r = model.embed_masked(&samples, &mask);
     assert!(
-      matches!(r, Err(Error::NonFiniteInput)),
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
       "embed_masked must reject NaN at masked-out position: got {r:?}"
     );
 
@@ -1236,7 +1312,7 @@ mod tests {
     samples[5] = f32::INFINITY;
     let r = model.embed_masked_raw(&samples, &mask);
     assert!(
-      matches!(r, Err(Error::NonFiniteInput)),
+      matches!(r, Err(Error::Core(EmbedCore::NonFiniteInput))),
       "embed_masked_raw must reject +inf at masked-out position: got {r:?}"
     );
 

@@ -12,11 +12,10 @@ use ort::{
   value::TensorRef,
 };
 
+use diaric::segment::Error as SegCore;
+
 use crate::segment::{
-  error::Error,
-  options::{FRAMES_PER_WINDOW, POWERSET_CLASSES, WINDOW_SAMPLES},
-  segmenter::Segmenter,
-  types::{Action, Event},
+  Action, Event, FRAMES_PER_WINDOW, POWERSET_CLASSES, Segmenter, WINDOW_SAMPLES, error::Error,
 };
 
 /// Builder for [`SegmentModel`] runtime configuration.
@@ -132,7 +131,7 @@ impl SegmentModelOptions {
 /// (silero/src/session.rs line 61: "Send but not Sync").
 ///
 /// **Shape validation:** v0.1.0 validates the model's output shape on first
-/// inference (returns [`Error::InferenceShapeMismatch`] if `[589, 7]` is
+/// inference (returns [`SegCore::InferenceShapeMismatch`] if `[589, 7]` is
 /// violated). Load-time dimension verification (`Error::IncompatibleModel`)
 /// is reserved for a future revision once a stable ort metadata API is
 /// available.
@@ -338,10 +337,13 @@ impl SegmentModel {
     }
     let expected = FRAMES_PER_WINDOW * POWERSET_CLASSES;
     if data.len() != expected {
-      return Err(Error::InferenceShapeMismatch {
-        expected,
-        got: data.len(),
-      });
+      return Err(
+        SegCore::InferenceShapeMismatch {
+          expected,
+          got: data.len(),
+        }
+        .into(),
+      );
     }
     // Reject non-finite logits before returning to the caller. The
     // owned and streaming offline paths immediately softmax these
@@ -357,7 +359,15 @@ impl SegmentModel {
   }
 }
 
-impl Segmenter {
+/// Extension trait that adds the ONNX segmentation driving loop to
+/// [`Segmenter`](crate::segment::Segmenter).
+///
+/// [`Segmenter`](crate::segment::Segmenter) is the backend-free sans-I/O
+/// state machine (defined in the `diaric` crate); these methods drive it to
+/// quiescence by fulfilling each `NeedsInference` via a [`SegmentModel`].
+/// Bring the trait into scope — `use diarization::segment::SegmenterExt;` —
+/// to call `process_samples` / `finish_stream` as methods on a `Segmenter`.
+pub trait SegmenterExt {
   /// Push samples and drive the state machine to a quiescent state by
   /// fulfilling each `NeedsInference` via `model.infer`. `emit` is called
   /// for every emitted [`Event`].
@@ -365,29 +375,18 @@ impl Segmenter {
   /// This is the streaming entry point that mirrors
   /// `silero::Session::process_stream`.
   ///
-  /// **Retry contract** (): if a previous call left a
-  /// stashed inference (a transient `model.infer` failure or
-  /// `Error::NonFiniteScores` from `push_inference`), this call
-  /// retries the stash BEFORE pushing new audio. On a stash retry
-  /// failure, the new `samples` are NOT appended — the caller can
-  /// safely re-pass the same chunk without double-counting it. Mirror
-  /// of the diarizer-level retry boundary.
-  #[cfg_attr(docsrs, doc(cfg(feature = "ort")))]
-  pub fn process_samples<F>(
+  /// **Retry contract**: if a previous call left a stashed inference (a
+  /// transient `model.infer` failure or a non-finite-scores rejection from
+  /// `push_inference`), this call retries the stash BEFORE pushing new
+  /// audio. On a stash retry failure, the new `samples` are NOT appended —
+  /// the caller can safely re-pass the same chunk without double-counting
+  /// it. Mirror of the diarizer-level retry boundary.
+  fn process_samples<F: FnMut(Event)>(
     &mut self,
     model: &mut SegmentModel,
     samples: &[f32],
-    mut emit: F,
-  ) -> Result<(), Error>
-  where
-    F: FnMut(Event),
-  {
-    if self.pending_inference.is_some() {
-      self.drain(model, &mut emit)?;
-    }
-    self.push_samples(samples);
-    self.drain(model, &mut emit)
-  }
+    emit: F,
+  ) -> Result<(), Error>;
 
   /// Equivalent to `finish` followed by draining all remaining actions
   /// (running inference for any unprocessed window).
@@ -396,81 +395,108 @@ impl Segmenter {
   /// the segmenter is not left half-finished if the stash retry fails.
   /// `finish()` is idempotent, so re-driving `finish_stream` after a
   /// retryable error is safe.
-  #[cfg_attr(docsrs, doc(cfg(feature = "ort")))]
-  pub fn finish_stream<F>(&mut self, model: &mut SegmentModel, mut emit: F) -> Result<(), Error>
-  where
-    F: FnMut(Event),
-  {
-    if self.pending_inference.is_some() {
-      self.drain(model, &mut emit)?;
+  fn finish_stream<F: FnMut(Event)>(
+    &mut self,
+    model: &mut SegmentModel,
+    emit: F,
+  ) -> Result<(), Error>;
+}
+
+impl SegmenterExt for Segmenter {
+  fn process_samples<F: FnMut(Event)>(
+    &mut self,
+    model: &mut SegmentModel,
+    samples: &[f32],
+    mut emit: F,
+  ) -> Result<(), Error> {
+    if self.has_pending_inference() {
+      drain(self, model, &mut emit)?;
+    }
+    self.push_samples(samples);
+    drain(self, model, &mut emit)
+  }
+
+  fn finish_stream<F: FnMut(Event)>(
+    &mut self,
+    model: &mut SegmentModel,
+    mut emit: F,
+  ) -> Result<(), Error> {
+    if self.has_pending_inference() {
+      drain(self, model, &mut emit)?;
     }
     self.finish();
-    self.drain(model, &mut emit)
+    drain(self, model, &mut emit)
+  }
+}
+
+/// Drive `seg` to quiescence, fulfilling each `NeedsInference` via
+/// `model.infer` + `seg.push_inference`. Shared by
+/// [`SegmenterExt::process_samples`] and [`SegmenterExt::finish_stream`].
+fn drain<F: FnMut(Event)>(
+  seg: &mut Segmenter,
+  model: &mut SegmentModel,
+  emit: &mut F,
+) -> Result<(), Error> {
+  // Retry any stashed inference from a prior failed drain BEFORE polling
+  // new actions. Without this, an `infer`/`push_inference` failure popped
+  // `Action::NeedsInference`, returned Err, and lost the in-flight
+  // `(WindowId, samples)` pair forever — `WindowId` stayed pending and
+  // finalization could stall. `Segmenter`'s stash is reached through its
+  // `take_pending_inference` / `stash_pending_inference` accessors since it
+  // lives in the `diaric` crate.
+  //
+  // Two retryable failure modes share the stash:
+  //   1. `model.infer` returns Err   → transient backend failure.
+  //   2. `model.infer` returns Ok but `push_inference` rejects the logits
+  //      (`SegCore::NonFiniteScores`) → the segmenter intentionally leaves
+  //      `id` pending so the caller can retry with valid scores from a re-run.
+  if let Some((id, samples)) = seg.take_pending_inference() {
+    match model.infer(&samples) {
+      Ok(scores) => match seg.push_inference(id, &scores) {
+        Ok(()) => {}
+        Err(e @ SegCore::NonFiniteScores { .. }) => {
+          seg.stash_pending_inference(id, samples);
+          return Err(e.into());
+        }
+        Err(e) => return Err(e.into()),
+      },
+      Err(e) => {
+        seg.stash_pending_inference(id, samples);
+        return Err(e);
+      }
+    }
   }
 
-  fn drain<F>(&mut self, model: &mut SegmentModel, emit: &mut F) -> Result<(), Error>
-  where
-    F: FnMut(Event),
-  {
-    // Retry any stashed inference from a prior failed drain BEFORE
-    // polling new actions. Without this, an `infer`/`push_inference`
-    // failure popped `Action::NeedsInference`, returned Err, and lost
-    // the in-flight `(WindowId, samples)` pair forever — `WindowId`
-    // stayed in `pending` and finalization could stall.
-    //
-    // Two retryable failure modes share the stash, mirroring the
-    // diarizer's `pending_seg_inference` semantics:
-    //   1. `model.infer` returns Err   → transient backend failure.
-    //   2. `model.infer` returns Ok but `push_inference` rejects the
-    //      logits (e.g. `Error::NonFiniteScores`)
-    //      → segmenter intentionally leaves `id` pending so the caller
-    //         can retry with valid scores from a re-run.
-    if let Some((id, samples)) = self.pending_inference.take() {
-      match model.infer(&samples) {
-        Ok(scores) => match self.push_inference(id, &scores) {
-          Ok(()) => {}
-          Err(e @ Error::NonFiniteScores { .. }) => {
-            self.pending_inference = Some((id, samples));
+  while let Some(action) = seg.poll() {
+    match action {
+      Action::NeedsInference { id, samples } => {
+        // Stash before invoking the model so a transient failure
+        // (or non-finite logits) doesn't lose the action handle.
+        match model.infer(&samples) {
+          Ok(scores) => match seg.push_inference(id, &scores) {
+            Ok(()) => {}
+            Err(e @ SegCore::NonFiniteScores { .. }) => {
+              seg.stash_pending_inference(id, samples);
+              return Err(e.into());
+            }
+            Err(e) => return Err(e.into()),
+          },
+          Err(e) => {
+            seg.stash_pending_inference(id, samples);
             return Err(e);
           }
-          Err(e) => return Err(e),
-        },
-        Err(e) => {
-          self.pending_inference = Some((id, samples));
-          return Err(e);
         }
       }
+      Action::Activity(a) => emit(Event::Activity(a)),
+      Action::VoiceSpan(r) => emit(Event::VoiceSpan(r)),
+      // Layer 2 hides per-frame raw probabilities from the caller, the
+      // same way it hides `NeedsInference`. Diarizer-grade callers that
+      // need `SpeakerScores` use the Layer-1 `poll` API directly.
+      Action::SpeakerScores { .. } => {}
+      // `diaric::segment::Action` is `#[non_exhaustive]`; ignore any
+      // future variants (matches the `SpeakerScores` no-op above).
+      _ => {}
     }
-
-    while let Some(action) = self.poll() {
-      match action {
-        Action::NeedsInference { id, samples } => {
-          // Stash before invoking the model so a transient failure
-          // (or non-finite logits) doesn't lose the action handle.
-          //
-          match model.infer(&samples) {
-            Ok(scores) => match self.push_inference(id, &scores) {
-              Ok(()) => {}
-              Err(e @ Error::NonFiniteScores { .. }) => {
-                self.pending_inference = Some((id, samples));
-                return Err(e);
-              }
-              Err(e) => return Err(e),
-            },
-            Err(e) => {
-              self.pending_inference = Some((id, samples));
-              return Err(e);
-            }
-          }
-        }
-        Action::Activity(a) => emit(Event::Activity(a)),
-        Action::VoiceSpan(r) => emit(Event::VoiceSpan(r)),
-        // Layer 2 hides per-frame raw probabilities from the caller, the
-        // same way it hides `NeedsInference`. Diarizer-grade callers that
-        // need `SpeakerScores` use the Layer-1 `poll` API directly.
-        Action::SpeakerScores { .. } => {}
-      }
-    }
-    Ok(())
   }
+  Ok(())
 }
