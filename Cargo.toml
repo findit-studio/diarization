@@ -182,7 +182,7 @@ hound = "3"
 # downstream consumers never need it transitively, (c) examples have
 # access to dev-dependencies, so keeping it here both lightens the
 # public dependency graph and the feature surface.
-silero = "0.4"
+silero = "0.5"
 # `.npz` fixture loading for the ONNX end-to-end parity tests
 # (`tests/parity_drift_10.rs`, `tests/parity_fixtures_endtoend.rs`) and the
 # `run_offline_from_captures` example. Production code embeds the PLDA
